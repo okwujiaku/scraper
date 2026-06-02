@@ -298,8 +298,15 @@ async def main():
             print(f"[{account.get('name', 'Unknown')}] No token set; skipping.", flush=True)
             continue
 
+        if not account["chat_id"]:
+            raise SystemExit(
+                f"[{account['name']}] TOKEN is set but CHAT_ID is missing. "
+                f"Add CHAT_ID_CLIENT_1 to your Render Environment variables "
+                f"(Dashboard → your service → Environment), then redeploy."
+            )
+
         print(
-            f"[{account['name']}] Connecting (target chat {account['chat_id'] or 'not set'})...",
+            f"[{account['name']}] Connecting (target chat {account['chat_id']})...",
             flush=True,
         )
         client = ScraperClient(
