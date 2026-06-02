@@ -13,9 +13,14 @@ Service and may result in your account being banned. Use at your own risk.
 import asyncio
 import os
 import re
+import sys
 
 import discord
 from dotenv import load_dotenv
+
+# Render (and other hosts) buffer stdout; flush each line so logs show live.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
 # Enable ANSI colors on Windows terminals (no-op if colorama isn't installed).
 try:
@@ -39,15 +44,12 @@ try:
         discord.state.ConnectionState.parse_ready_supplemental
     )
 
-    def _safe_parse_ready_supplemental(self, data, *args, **kwargs):
-        if isinstance(data, dict) and data.get("pending_payments") is None:
-            data["pending_payments"] = []
-        try:
-            return _orig_parse_ready_supplemental(self, data, *args, **kwargs)
-        except TypeError:
-            # Last-resort guard: never let a malformed READY_SUPPLEMENTAL
-            # payload tear down the client.
-            return None
+    def _safe_parse_ready_supplemental(self, extra_data, *args, **kwargs):
+        # pending_payments lives on self._ready_data, not extra_data.
+        ready = getattr(self, "_ready_data", None)
+        if isinstance(ready, dict) and ready.get("pending_payments") is None:
+            ready["pending_payments"] = []
+        return _orig_parse_ready_supplemental(self, extra_data, *args, **kwargs)
 
     discord.state.ConnectionState.parse_ready_supplemental = (
         _safe_parse_ready_supplemental
@@ -197,10 +199,27 @@ class ScraperClient(discord.Client):
         super().__init__(*args, **kwargs)
         self.name = name
         self.target_chat_id = target_chat_id
+        self._target_channel = None
 
     async def on_ready(self):
-        print(f"[{self.name}] Logged in as {self.user} (id: {self.user.id})")
-        print(f"[{self.name}] Capturing all new-member joins across every visible server...")
+        print(f"[{self.name}] Logged in as {self.user} (id: {self.user.id})", flush=True)
+        print(
+            f"[{self.name}] Watching {len(self.guilds)} server(s) for log-bot join messages...",
+            flush=True,
+        )
+
+        if not self.target_chat_id:
+            print(f"[{self.name}] No target chat ID configured; will capture but not forward.", flush=True)
+            return
+
+        try:
+            self._target_channel = await self.fetch_channel(self.target_chat_id)
+            print(f"[{self.name}] Forwarding captures to: {self._target_channel}", flush=True)
+        except Exception as exc:
+            print(
+                f"[{self.name}] Could not open target chat {self.target_chat_id}: {exc}",
+                flush=True,
+            )
 
     async def on_message(self, message):
         # Collect text from the plain content and from every embed (title,
@@ -244,15 +263,26 @@ class ScraperClient(discord.Client):
 
             process_extracted_data(data)
 
-            # Forward the captured event to this client's dedicated group chat.
-            channel = self.get_channel(self.target_chat_id)
+            if not self.target_chat_id:
+                return
+
+            channel = self._target_channel
             if channel is None:
-                print(f"[{self.name}] Could not find target chat {self.target_chat_id}; skipping send.")
-            else:
                 try:
-                    await channel.send(build_message(data))
+                    channel = await self.fetch_channel(self.target_chat_id)
+                    self._target_channel = channel
                 except Exception as exc:
-                    print(f"[{self.name}] Failed to send to chat {self.target_chat_id}: {exc}")
+                    print(
+                        f"[{self.name}] Could not find target chat {self.target_chat_id}: {exc}",
+                        flush=True,
+                    )
+                    return
+
+            try:
+                await channel.send(build_message(data))
+                print(f"[{self.name}] Forwarded capture for {data.get('username') or 'unknown'}.", flush=True)
+            except Exception as exc:
+                print(f"[{self.name}] Failed to send to chat {self.target_chat_id}: {exc}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -260,13 +290,18 @@ class ScraperClient(discord.Client):
 # ---------------------------------------------------------------------------
 
 async def main():
+    print("Starting scraper...", flush=True)
     tasks = []
     for account in ACCOUNTS:
         token = account.get("token")
         if not token:
-            print(f"[{account.get('name', 'Unknown')}] No token set; skipping.")
+            print(f"[{account.get('name', 'Unknown')}] No token set; skipping.", flush=True)
             continue
 
+        print(
+            f"[{account['name']}] Connecting (target chat {account['chat_id'] or 'not set'})...",
+            flush=True,
+        )
         client = ScraperClient(
             name=account["name"],
             target_chat_id=account["chat_id"],
