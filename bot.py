@@ -13,9 +13,38 @@ Service and may result in your account being banned. Use at your own risk.
 import asyncio
 import os
 import re
+from datetime import datetime, timezone
 
 import discord
 from dotenv import load_dotenv
+
+# Enable ANSI colors on Windows terminals (no-op if colorama isn't installed).
+try:
+    import colorama
+    colorama.just_fix_windows_console()
+except Exception:
+    pass
+
+
+# ---------------------------------------------------------------------------
+# TERMINAL STYLING
+# ---------------------------------------------------------------------------
+
+class C:
+    """Small ANSI color palette for a premium, colorful terminal layout."""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    GOLD = "\033[38;5;220m"
+    CYAN = "\033[38;5;51m"
+    GREEN = "\033[38;5;48m"
+    PINK = "\033[38;5;213m"
+    PURPLE = "\033[38;5;141m"
+    GRAY = "\033[38;5;245m"
+    WHITE = "\033[97m"
+
+# Accent color for the Discord embed sidebar (premium gold).
+EMBED_COLOR = 0xF5A623
 
 
 # ---------------------------------------------------------------------------
@@ -60,41 +89,82 @@ ACCOUNTS = [
 # DATA HANDLER
 # ---------------------------------------------------------------------------
 
-def build_box(data: dict) -> str:
-    """Return a parsed join event rendered as a clean, boxed layout string."""
-    rows = [
-        ("Date",          data.get("date")),
-        ("Time",          data.get("time")),
-        ("Username",      data.get("username")),
-        ("Target Server", data.get("server_name")),
-    ]
-
-    # Width is sized to the longest value so the box always lines up neatly.
-    label_width = max(len(label) for label, _ in rows)
-    values = [str(value) if value is not None else "N/A" for _, value in rows]
-    inner_width = max(len("NEW MEMBER CAPTURED"),
-                      max(label_width + 2 + len(v) for v in values))
-
-    border = "+" + "-" * (inner_width + 2) + "+"
-
-    lines = [
-        border,
-        "| " + "NEW MEMBER CAPTURED".center(inner_width) + " |",
-        border,
-    ]
-    for (label, _), value in zip(rows, values):
-        line = f"{label:<{label_width}} : {value}"
-        lines.append("| " + line.ljust(inner_width) + " |")
-    lines.append(border)
-
-    return "\n".join(lines)
+# Icons paired with each field for a richer, more scannable layout.
+FIELD_STYLE = [
+    ("Date",          "date",        "📅", C.CYAN),
+    ("Time",          "time",        "⏰", C.CYAN),
+    ("Username",      "username",    "👤", C.GREEN),
+    ("Target Server", "server_name", "🏠", C.PURPLE),
+]
 
 
 def process_extracted_data(data: dict):
-    """Print a parsed join event to the terminal in a clean, boxed layout."""
+    """Print a parsed join event to the terminal in a colorful, premium box."""
+    rows = [(label, icon, color, data.get(key) or "N/A")
+            for label, key, icon, color in FIELD_STYLE]
+
+    title = "✨ NEW MEMBER CAPTURED ✨"
+    title_cells = len(title) + 2  # +2 for the two emoji rendering as 2 cells each
+
+    label_width = max(len(label) for label, *_ in rows)
+    # Plain content width (icon counts as 2 cells + 1 space) drives alignment.
+    inner_width = max(
+        title_cells,
+        max(3 + label_width + 3 + len(str(value)) for *_, value in rows),
+    )
+
+    top = f"{C.GOLD}╔{'═' * (inner_width + 2)}╗{C.RESET}"
+    sep = f"{C.GOLD}╠{'═' * (inner_width + 2)}╣{C.RESET}"
+    bot = f"{C.GOLD}╚{'═' * (inner_width + 2)}╝{C.RESET}"
+    bar = f"{C.GOLD}║{C.RESET}"
+
+    title_pad = inner_width - title_cells
+    left = title_pad // 2
+    right = title_pad - left
+
     print()
-    print(build_box(data))
+    print(top)
+    print(f"{bar} {' ' * left}{C.BOLD}{C.PINK}{title}{C.RESET}{' ' * right} {bar}")
+    print(sep)
+    for label, icon, color, value in rows:
+        plain_len = 3 + label_width + 3 + len(str(value))  # icon+sp + label + " : "
+        pad = " " * (inner_width - plain_len)
+        print(
+            f"{bar} {icon} {color}{label:<{label_width}}{C.RESET}"
+            f"{C.GRAY} : {C.RESET}{C.WHITE}{value}{C.RESET}{pad} {bar}"
+        )
+    print(bot)
     print()
+
+
+def build_embed(data: dict, source_name: str) -> discord.Embed:
+    """Build a colorful, premium Discord embed with icons and copy-ready fields."""
+    username = data.get("username") or "N/A"
+    user_id = data.get("user_id")
+
+    embed = discord.Embed(
+        title="🎉  New Member Captured",
+        color=EMBED_COLOR,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    embed.add_field(name="📅 Date", value=f"`{data.get('date') or 'N/A'}`", inline=True)
+    embed.add_field(name="⏰ Time", value=f"`{data.get('time') or 'N/A'}`", inline=True)
+    embed.add_field(name="🏠 Target Server",
+                    value=f"`{data.get('server_name') or 'N/A'}`", inline=False)
+
+    # Multiline code block => Discord shows a Copy button on desktop hover and
+    # supports tap-and-hold copy on mobile.
+    embed.add_field(name="👤 Username (click Copy)",
+                    value=f"```\n{username}\n```", inline=False)
+
+    if user_id:
+        mention = f" • <@{user_id}>" if str(user_id).isdigit() else ""
+        embed.add_field(name="🆔 User ID",
+                        value=f"```\n{user_id}\n```{mention}", inline=False)
+
+    embed.set_footer(text=f"✨ Captured by {source_name}")
+    return embed
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +208,7 @@ class ScraperClient(discord.Client):
             time_match = re.search(r"Time:\s*(.+)", full_text)
             username_match = re.search(r"Username:\s*(.+)", full_text)
             server_match = re.search(r"Server:\s*(.+)", full_text)
+            user_id_match = re.search(r"User ID:\s*(.+)", full_text)
 
             def clean(match):
                 # Strip Discord markdown clutter (** bold and ` code) from a value.
@@ -150,6 +221,7 @@ class ScraperClient(discord.Client):
                 "time": clean(time_match),
                 "username": clean(username_match),
                 "server_name": clean(server_match),
+                "user_id": clean(user_id_match),
             }
 
             process_extracted_data(data)
@@ -159,7 +231,10 @@ class ScraperClient(discord.Client):
             if channel is None:
                 print(f"[{self.name}] Could not find target chat {self.target_chat_id}; skipping send.")
             else:
-                await channel.send("```\n" + build_box(data) + "\n```")
+                try:
+                    await channel.send(embed=build_embed(data, self.name))
+                except Exception as exc:
+                    print(f"[{self.name}] Failed to send to chat {self.target_chat_id}: {exc}")
 
 
 # ---------------------------------------------------------------------------
