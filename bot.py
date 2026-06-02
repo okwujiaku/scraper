@@ -13,7 +13,6 @@ Service and may result in your account being banned. Use at your own risk.
 import asyncio
 import os
 import re
-from datetime import datetime, timezone
 
 import discord
 from dotenv import load_dotenv
@@ -42,9 +41,6 @@ class C:
     PURPLE = "\033[38;5;141m"
     GRAY = "\033[38;5;245m"
     WHITE = "\033[97m"
-
-# Accent color for the Discord embed sidebar (premium gold).
-EMBED_COLOR = 0xF5A623
 
 
 # ---------------------------------------------------------------------------
@@ -137,34 +133,25 @@ def process_extracted_data(data: dict):
     print()
 
 
-def build_embed(data: dict, source_name: str) -> discord.Embed:
-    """Build a colorful, premium Discord embed with icons and copy-ready fields."""
-    username = data.get("username") or "N/A"
-    user_id = data.get("user_id")
+def build_message(data: dict) -> str:
+    """Build a clean, premium Discord message using markdown + icons.
 
-    embed = discord.Embed(
-        title="🎉  New Member Captured",
-        color=EMBED_COLOR,
-        timestamp=datetime.now(timezone.utc),
-    )
+    User accounts (self-bots) cannot send rich embeds, so the look is recreated
+    with bold markdown and emoji icons. Username uses inline code so it stays
+    copy-friendly (tap-to-copy) without showing a bulky code-block write-up.
+    Target Server is intentionally the last line of the card.
+    """
+    card = [
+        "🎉 **NEW MEMBER CAPTURED** 🎉",
+        f"📅 **Date:** {data.get('date') or 'N/A'}",
+        f"⏰ **Time:** {data.get('time') or 'N/A'}",
+        f"👤 **Username:** `{data.get('username') or 'N/A'}`",
+        f"🆔 **User ID:** {data.get('user_id') or 'N/A'}",
+        f"🏠 **Target Server:** {data.get('server_name') or 'N/A'}",
+    ]
 
-    embed.add_field(name="📅 Date", value=f"`{data.get('date') or 'N/A'}`", inline=True)
-    embed.add_field(name="⏰ Time", value=f"`{data.get('time') or 'N/A'}`", inline=True)
-    embed.add_field(name="🏠 Target Server",
-                    value=f"`{data.get('server_name') or 'N/A'}`", inline=False)
-
-    # Multiline code block => Discord shows a Copy button on desktop hover and
-    # supports tap-and-hold copy on mobile.
-    embed.add_field(name="👤 Username (click Copy)",
-                    value=f"```\n{username}\n```", inline=False)
-
-    if user_id:
-        mention = f" • <@{user_id}>" if str(user_id).isdigit() else ""
-        embed.add_field(name="🆔 User ID",
-                        value=f"```\n{user_id}\n```{mention}", inline=False)
-
-    embed.set_footer(text=f"✨ Captured by {source_name}")
-    return embed
+    # Trailing blank line + divider gives clear spacing between stacked results.
+    return "\n".join(card) + "\n\u200b\n" + "─" * 30
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +219,7 @@ class ScraperClient(discord.Client):
                 print(f"[{self.name}] Could not find target chat {self.target_chat_id}; skipping send.")
             else:
                 try:
-                    await channel.send(embed=build_embed(data, self.name))
+                    await channel.send(build_message(data))
                 except Exception as exc:
                     print(f"[{self.name}] Failed to send to chat {self.target_chat_id}: {exc}")
 
