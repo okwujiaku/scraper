@@ -83,35 +83,35 @@ class C:
 # Load secrets from the local .env file (never commit .env to git).
 load_dotenv()
 
-# Each account runs independently with its own token and target group chat.
-# Add more entries here to scale up; populate the matching keys in your .env.
-ACCOUNTS = [
-    {
-        "name": "Client 1",
-        "token": os.getenv("TOKEN_CLIENT_1"),
-        "chat_id": int(os.getenv("CHAT_ID_CLIENT_1") or 0),
-    },
-    {
-        "name": "Client 2",
-        "token": os.getenv("TOKEN_CLIENT_2"),
-        "chat_id": int(os.getenv("CHAT_ID_CLIENT_2") or 0),
-    },
-    {
-        "name": "Client 3",
-        "token": os.getenv("TOKEN_CLIENT_3"),
-        "chat_id": int(os.getenv("CHAT_ID_CLIENT_3") or 0),
-    },
-    {
-        "name": "Client 4",
-        "token": os.getenv("TOKEN_CLIENT_4"),
-        "chat_id": int(os.getenv("CHAT_ID_CLIENT_4") or 0),
-    },
-    {
-        "name": "Client 5",
-        "token": os.getenv("TOKEN_CLIENT_5"),
-        "chat_id": int(os.getenv("CHAT_ID_CLIENT_5") or 0),
-    },
-]
+
+def load_accounts():
+    """Load every TOKEN_CLIENT_N / CHAT_ID_CLIENT_N pair from the environment."""
+    accounts = []
+    for i in range(1, 21):
+        token = (os.getenv(f"TOKEN_CLIENT_{i}") or "").strip()
+        if not token:
+            continue
+
+        chat_id_raw = (os.getenv(f"CHAT_ID_CLIENT_{i}") or "").strip()
+        try:
+            chat_id = int(chat_id_raw) if chat_id_raw else 0
+        except ValueError:
+            raise SystemExit(
+                f"CHAT_ID_CLIENT_{i} must be a numeric Discord channel ID, got: {chat_id_raw!r}"
+            )
+
+        accounts.append(
+            {
+                "index": i,
+                "name": (os.getenv(f"NAME_CLIENT_{i}") or f"Client {i}").strip(),
+                "token": token,
+                "chat_id": chat_id,
+            }
+        )
+    return accounts
+
+
+ACCOUNTS = load_accounts()
 
 
 # ---------------------------------------------------------------------------
@@ -127,8 +127,9 @@ FIELD_STYLE = [
 ]
 
 
-def process_extracted_data(data: dict):
+def process_extracted_data(data: dict, client_name: str = ""):
     """Print a parsed join event to the terminal in a colorful, premium box."""
+    prefix = f"[{client_name}] " if client_name else ""
     rows = [(label, icon, color, data.get(key) or "N/A")
             for label, key, icon, color in FIELD_STYLE]
 
@@ -152,6 +153,8 @@ def process_extracted_data(data: dict):
     right = title_pad - left
 
     print()
+    if prefix:
+        print(f"{prefix}capture detected", flush=True)
     print(top)
     print(f"{bar} {' ' * left}{C.BOLD}{C.PINK}{title}{C.RESET}{' ' * right} {bar}")
     print(sep)
@@ -261,7 +264,7 @@ class ScraperClient(discord.Client):
                 "user_id": clean(user_id_match),
             }
 
-            process_extracted_data(data)
+            process_extracted_data(data, client_name=self.name)
 
             if not self.target_chat_id:
                 return
@@ -289,19 +292,33 @@ class ScraperClient(discord.Client):
 # RUNNER
 # ---------------------------------------------------------------------------
 
+async def run_client(account: dict):
+    """Start one account; keep other accounts running if this one fails."""
+    client = ScraperClient(
+        name=account["name"],
+        target_chat_id=account["chat_id"],
+    )
+    try:
+        await client.start(account["token"])
+    except Exception as exc:
+        print(f"[{account['name']}] Stopped: {exc}", flush=True)
+
+
 async def main():
     print("Starting scraper...", flush=True)
+
+    if not ACCOUNTS:
+        raise SystemExit(
+            "No accounts found. Add TOKEN_CLIENT_1 / CHAT_ID_CLIENT_1 "
+            "(and TOKEN_CLIENT_2 / CHAT_ID_CLIENT_2, etc.) to your environment."
+        )
+
     tasks = []
     for account in ACCOUNTS:
-        token = account.get("token")
-        if not token:
-            print(f"[{account.get('name', 'Unknown')}] No token set; skipping.", flush=True)
-            continue
-
         if not account["chat_id"]:
             raise SystemExit(
-                f"[{account['name']}] TOKEN is set but CHAT_ID is missing. "
-                f"Add CHAT_ID_CLIENT_1 to your Render Environment variables "
+                f"[{account['name']}] TOKEN_CLIENT_{account['index']} is set but "
+                f"CHAT_ID_CLIENT_{account['index']} is missing. Add it in Render "
                 f"(Dashboard → your service → Environment), then redeploy."
             )
 
@@ -309,18 +326,9 @@ async def main():
             f"[{account['name']}] Connecting (target chat {account['chat_id']})...",
             flush=True,
         )
-        client = ScraperClient(
-            name=account["name"],
-            target_chat_id=account["chat_id"],
-        )
-        tasks.append(client.start(token))
+        tasks.append(asyncio.create_task(run_client(account)))
 
-    if not tasks:
-        raise SystemExit(
-            "No valid accounts found. Add TOKEN_CLIENT_1 / CHAT_ID_CLIENT_1 "
-            "(etc.) to your .env file."
-        )
-
+    print(f"Launching {len(tasks)} account(s)...", flush=True)
     await asyncio.gather(*tasks)
 
 
