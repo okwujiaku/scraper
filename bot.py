@@ -26,6 +26,37 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
+# LIBRARY COMPATIBILITY PATCH
+# ---------------------------------------------------------------------------
+# discord.py-self's parse_ready_supplemental crashes when Discord sends
+# "pending_payments": null (the .get(..., []) default never applies because the
+# key exists with a None value), raising:
+#     TypeError: 'NoneType' object is not iterable
+# We wrap the original parser so a None payload is treated as an empty list,
+# keeping the connection alive instead of killing the whole gather().
+try:
+    _orig_parse_ready_supplemental = (
+        discord.state.ConnectionState.parse_ready_supplemental
+    )
+
+    def _safe_parse_ready_supplemental(self, data, *args, **kwargs):
+        if isinstance(data, dict) and data.get("pending_payments") is None:
+            data["pending_payments"] = []
+        try:
+            return _orig_parse_ready_supplemental(self, data, *args, **kwargs)
+        except TypeError:
+            # Last-resort guard: never let a malformed READY_SUPPLEMENTAL
+            # payload tear down the client.
+            return None
+
+    discord.state.ConnectionState.parse_ready_supplemental = (
+        _safe_parse_ready_supplemental
+    )
+except Exception:
+    pass
+
+
+# ---------------------------------------------------------------------------
 # TERMINAL STYLING
 # ---------------------------------------------------------------------------
 
