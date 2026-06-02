@@ -112,75 +112,6 @@ def load_accounts():
 
 
 ACCOUNTS = load_accounts()
-ALL_TARGET_CHATS = sorted({account["chat_id"] for account in ACCOUNTS if account["chat_id"]})
-
-
-# ---------------------------------------------------------------------------
-# CAPTURE RELAY (shared across all clients)
-# ---------------------------------------------------------------------------
-
-def capture_key(data: dict) -> str:
-    """Stable id for deduplicating the same join across clients/chats."""
-    return f"{data.get('user_id') or ''}:{data.get('server_name') or ''}:{data.get('username') or ''}"
-
-
-class CaptureRelay:
-    """When any account captures a join, deliver it to every target group chat.
-
-    Each chat is sent by the account that owns it (self-bots can only post in
-    chats they belong to). Dedup prevents double-posting when multiple accounts
-    see the same log-bot message.
-    """
-
-    def __init__(self):
-        self._lock = asyncio.Lock()
-        self._delivered: dict[str, set[int]] = {}
-        self._clients_by_chat: dict[int, "ScraperClient"] = {}
-
-    def register(self, client: "ScraperClient") -> None:
-        if client.target_chat_id:
-            self._clients_by_chat[client.target_chat_id] = client
-
-    def _prune_old(self) -> None:
-        # Keep dedup memory bounded; entries older than 10 minutes are dropped.
-        if len(self._delivered) > 500:
-            self._delivered.clear()
-
-    async def relay(self, source: "ScraperClient", data: dict) -> None:
-        key = capture_key(data)
-        username = data.get("username") or "unknown"
-
-        for chat_id in ALL_TARGET_CHATS:
-            async with self._lock:
-                if chat_id in self._delivered.get(key, set()):
-                    continue
-
-            owner = self._clients_by_chat.get(chat_id)
-            if owner is None:
-                print(
-                    f"[{source.name}] Relay skipped chat {chat_id}: owner not ready yet.",
-                    flush=True,
-                )
-                continue
-
-            try:
-                await owner.send_capture(data)
-            except Exception as exc:
-                print(
-                    f"[{owner.name}] Failed to send to chat {chat_id}: {exc}",
-                    flush=True,
-                )
-                continue
-
-            async with self._lock:
-                self._delivered.setdefault(key, set()).add(chat_id)
-                self._prune_old()
-
-            label = owner.name if owner is not source else source.name
-            print(f"[{label}] Forwarded capture for {username} → chat {chat_id}.", flush=True)
-
-
-RELAY = CaptureRelay()
 
 
 # ---------------------------------------------------------------------------
@@ -264,25 +195,14 @@ def build_message(data: dict) -> str:
 # ---------------------------------------------------------------------------
 
 class ScraperClient(discord.Client):
-    """A self-bot instance that scrapes join events and relays them to all
-    configured group chats via :class:`CaptureRelay`."""
+    """A self-bot instance that scrapes join events and forwards them only to
+    its own dedicated group chat."""
 
     def __init__(self, name: str, target_chat_id: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.name = name
         self.target_chat_id = target_chat_id
         self._target_channel = None
-
-    async def send_capture(self, data: dict) -> None:
-        if not self.target_chat_id:
-            return
-
-        channel = self._target_channel
-        if channel is None:
-            channel = await self.fetch_channel(self.target_chat_id)
-            self._target_channel = channel
-
-        await channel.send(build_message(data))
 
     async def on_ready(self):
         print(f"[{self.name}] Logged in as {self.user} (id: {self.user.id})", flush=True)
@@ -297,13 +217,7 @@ class ScraperClient(discord.Client):
 
         try:
             self._target_channel = await self.fetch_channel(self.target_chat_id)
-            RELAY.register(self)
             print(f"[{self.name}] Forwarding captures to: {self._target_channel}", flush=True)
-            print(
-                f"[{self.name}] Relay enabled — joins will also post to "
-                f"{len(ALL_TARGET_CHATS)} group chat(s).",
-                flush=True,
-            )
         except Exception as exc:
             print(
                 f"[{self.name}] Could not open target chat {self.target_chat_id}: {exc}",
@@ -351,7 +265,33 @@ class ScraperClient(discord.Client):
             }
 
             process_extracted_data(data, client_name=self.name)
-            await RELAY.relay(self, data)
+
+            if not self.target_chat_id:
+                return
+
+            channel = self._target_channel
+            if channel is None:
+                try:
+                    channel = await self.fetch_channel(self.target_chat_id)
+                    self._target_channel = channel
+                except Exception as exc:
+                    print(
+                        f"[{self.name}] Could not find target chat {self.target_chat_id}: {exc}",
+                        flush=True,
+                    )
+                    return
+
+            try:
+                await channel.send(build_message(data))
+                print(
+                    f"[{self.name}] Forwarded capture for {data.get('username') or 'unknown'}.",
+                    flush=True,
+                )
+            except Exception as exc:
+                print(
+                    f"[{self.name}] Failed to send to chat {self.target_chat_id}: {exc}",
+                    flush=True,
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -395,11 +335,6 @@ async def main():
         tasks.append(asyncio.create_task(run_client(account)))
 
     print(f"Launching {len(tasks)} account(s)...", flush=True)
-    print(
-        f"Broadcasting captures to {len(ALL_TARGET_CHATS)} group chat(s): "
-        f"{', '.join(str(c) for c in ALL_TARGET_CHATS)}",
-        flush=True,
-    )
     await asyncio.gather(*tasks)
 
 
