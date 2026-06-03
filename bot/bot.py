@@ -1,13 +1,10 @@
 """
 Universal single-client join capture engine (Option C).
 
-Deploy one Render Background Worker per customer. Each worker uses only:
-  - DISCORD_TOKEN  (user account token)
-  - CHAT_ID_CLIENT_1 (target group chat ID)
-
-Detects joins via custom log-bot text OR native Discord member-join messages,
-then forwards a premium markdown card to the configured group chat.
-(User accounts cannot send API embeds; formatted text is used instead.)
+Passive live listener only — no startup channel scans or background polls.
+Deploy one Render Background Worker per customer with:
+  - DISCORD_TOKEN
+  - CHAT_ID_CLIENT_1
 
 WARNING: Automating a user account (self-botting) violates Discord's ToS.
 """
@@ -57,19 +54,10 @@ DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or "").strip()
 CHAT_ID = int(
     (os.getenv("CHAT_ID_CLIENT_1") or os.getenv("CHAT_ID") or "0").strip() or 0
 )
-HISTORY_POLL_SECONDS = int((os.getenv("HISTORY_POLL_SECONDS") or "45").strip() or 45)
-POLL_HISTORY_LIMIT = int((os.getenv("POLL_HISTORY_LIMIT") or "3").strip() or 3)
 SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
 
-CHANNEL_KEYWORDS = (
-    "welcome", "joins", "join", "gate", "logs", "log", "member", "members",
-    "general", "audit", "arrival", "new", "notify", "bot",
-)
-FETCH_CHANNEL_TIMEOUT = 30
-
-# discord.py / discord.py-self name this differently across versions
 _NATIVE_JOIN_TYPES: tuple[discord.MessageType, ...] = tuple(
     t
     for t in (
@@ -78,10 +66,6 @@ _NATIVE_JOIN_TYPES: tuple[discord.MessageType, ...] = tuple(
     )
     if t is not None
 )
-
-
-def _is_native_join(message: discord.Message) -> bool:
-    return message.type in _NATIVE_JOIN_TYPES
 
 
 def _log(label: str, message: str) -> None:
@@ -136,7 +120,10 @@ def parse_custom_log(text: str) -> dict | None:
     fields = _field_map(text)
 
     has_user = "username:" in lowered or "username" in fields
-    has_id = any(k in lowered or k in fields for k in ("user id:", "userid:", "user id", "userid"))
+    has_id = any(
+        k in lowered or k in fields
+        for k in ("user id:", "userid:", "user id", "userid")
+    )
     has_join = any(
         phrase in lowered
         for phrase in (
@@ -178,8 +165,6 @@ def parse_custom_log(text: str) -> dict | None:
         return None
 
     return {
-        "date": fields.get("date") or from_regex(r"Date:\s*(.+)"),
-        "time": fields.get("time") or from_regex(r"Time:\s*(.+)"),
         "username": username,
         "user_id": user_id,
         "server_name": server_name,
@@ -187,44 +172,40 @@ def parse_custom_log(text: str) -> dict | None:
 
 
 def parse_native_join(message: discord.Message) -> dict | None:
-    if not _is_native_join(message):
+    if message.type not in _NATIVE_JOIN_TYPES:
         return None
     if not message.author:
         return None
 
     date_str, time_str = _format_timestamp(message.created_at)
-    server_name = message.guild.name if message.guild else None
-
-    username = message.author.display_name or str(message.author)
     return {
         "date": date_str,
         "time": time_str,
-        "username": username,
+        "username": message.author.display_name or str(message.author),
         "user_id": str(message.author.id),
-        "server_name": server_name,
+        "server_name": message.guild.name if message.guild else "N/A",
     }
 
 
-def build_capture_message(data: dict) -> str:
-    """Premium card as markdown (user tokens cannot send embeds on Discord's API)."""
-    lines = [
-        "🎉 **NEW MEMBER CAPTURED** 🎉",
-        f"📅 **Date:** {data.get('date') or 'N/A'}",
-        f"⏰ **Time:** {data.get('time') or 'N/A'}",
-        f"🆔 **User ID:** {data.get('user_id') or 'N/A'}",
-        f"👤 **Username:** `{data.get('username') or 'N/A'}`",
-        f"🏠 **Target Server:** {data.get('server_name') or 'N/A'}",
-        "",
-        "_Tap the username above to copy._",
-    ]
-    return "\n".join(lines) + "\n\u200b\n" + "─" * 30
+def build_capture_card(data: dict) -> str:
+    """Markdown card — user tokens cannot send embeds (API error 50006)."""
+    return (
+        "🎉 **NEW MEMBER CAPTURED** 🎉\n"
+        f"📅 **Date:** {data.get('date') or 'N/A'}\n"
+        f"⏰ **Time:** {data.get('time') or 'N/A'}\n"
+        f"🆔 **User ID:** {data.get('user_id') or 'N/A'}\n"
+        f"👤 **Username:** `{data.get('username') or 'N/A'}`\n"
+        f"🏠 **Target Server:** {data.get('server_name') or 'N/A'}\n"
+        "\n_Tap the username above to copy._\n\u200b\n"
+        + "─" * 30
+    )
 
 
-def build_startup_message(session_label: str, guild_count: int) -> str:
+def build_startup_card(session_label: str) -> str:
     return (
         "✅ **Scraper online**\n"
-        f"Session **{session_label}** is active.\n"
-        f"Monitoring **{guild_count}** server(s). New member captures will appear here."
+        f"Logged in as **{session_label}**.\n"
+        "Listening for new joins — captures will appear here instantly."
     )
 
 
@@ -246,237 +227,80 @@ def extract_capture(message: discord.Message) -> tuple[dict | None, str]:
 
 
 class UniversalJoinClient(discord.Client):
-    """One Discord user session → one output group chat."""
-
     def __init__(self, target_chat_id: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.target_chat_id = target_chat_id
-        self._target_channel: discord.abc.Messageable | None = None
-        self._seen_ids: set[int] = set()
-        self._poll_channels: list[discord.TextChannel] = []
-        self._session_label = "client"
-        self._captures = 0
-        self._messages_seen = 0
+        self._output_channel: discord.abc.Messageable | None = None
         self._monitor_from: datetime | None = None
-        self._ready_setup = False
-        self._setup_complete = False
-
-    @property
-    def session_label(self) -> str:
-        if self.user:
-            return str(self.user)
-        return self._session_label
+        self._seen_ids: set[int] = set()
+        self._ready_once = False
+        self._captures = 0
 
     async def on_ready(self):
-        if self._ready_setup:
+        if self._ready_once:
             return
-        self._ready_setup = True
-
+        self._ready_once = True
         self._monitor_from = datetime.now(timezone.utc)
-        self._session_label = str(self.user) if self.user else "client"
-        _log(self.session_label, f"Logged in (id: {self.user.id})")
-        _log(
-            self.session_label,
-            f"Live window: {_monitor_from.isoformat()} (only joins after bot start).",
-        )
-        _log(self.session_label, f"Monitoring {len(self.guilds)} server(s).")
+
+        print(f"[Success] Logged in as {self.user}", flush=True)
+        _log(str(self.user), f"Monitoring {len(self.guilds)} server(s) (live only).")
 
         try:
-            self._target_channel = await asyncio.wait_for(
+            self._output_channel = await asyncio.wait_for(
                 self.fetch_channel(self.target_chat_id),
-                timeout=FETCH_CHANNEL_TIMEOUT,
+                timeout=30,
             )
-            _log(
-                self.session_label,
-                f"Output chat: {self._target_channel} (id: {self.target_chat_id})",
-            )
-            if SEND_STARTUP_PING:
-                await self._send_startup_ping()
+            _log(str(self.user), f"Output chat: {self._output_channel}")
         except Exception as exc:
-            _log(self.session_label, f"Could not open output chat: {exc}")
+            _log(str(self.user), f"Could not open output chat: {exc}")
             return
 
-        self.loop.create_task(self._background_setup())
-        self.loop.create_task(self._history_poll_loop())
-        self.loop.create_task(self._heartbeat_loop())
-        _log(self.session_label, "Live listener active; channel warm-up running in background.")
-
-    async def _background_setup(self) -> None:
-        try:
-            await asyncio.sleep(3)
-            _log(self.session_label, "Discovering log channels...")
-            self._poll_channels = await self._discover_channels()
-            _log(
-                self.session_label,
-                f"Matched {len(self._poll_channels)} log channel(s); warming subscriptions...",
-            )
-            warmed, failed = await self._warm_channels(self._poll_channels)
-            self._setup_complete = True
-            _log(
-                self.session_label,
-                f"Ready: {len(self._poll_channels)} channels, warmed {warmed}, no access {failed}.",
-            )
-        except Exception as exc:
-            _log(self.session_label, f"Background setup error: {exc}")
-
-    async def _send_startup_ping(self) -> None:
-        if self._target_channel is None:
-            return
-        try:
-            content = build_startup_message(self.session_label, len(self.guilds))
-            await self._target_channel.send(content)
-            _log(self.session_label, "Startup message sent.")
-        except Exception as exc:
-            _log(self.session_label, f"Startup message failed: {exc}")
-
-    async def _guild_text_channels(self, guild: discord.Guild) -> list[discord.TextChannel]:
-        cached = [c for c in guild.text_channels if isinstance(c, discord.TextChannel)]
-        if cached:
-            return cached
-        try:
-            fetched = await asyncio.wait_for(guild.fetch_channels(), timeout=12)
-            return [c for c in fetched if isinstance(c, discord.TextChannel)]
-        except Exception:
-            return cached
-
-    def _channel_matches(self, channel: discord.TextChannel) -> bool:
-        name = (channel.name or "").lower()
-        return any(keyword in name for keyword in CHANNEL_KEYWORDS)
-
-    async def _discover_channels(self) -> list[discord.TextChannel]:
-        found: list[discord.TextChannel] = []
-        seen: set[int] = set()
-        for guild in self.guilds:
-            for channel in await self._guild_text_channels(guild):
-                if channel.id in seen:
-                    continue
-                if self._channel_matches(channel):
-                    found.append(channel)
-                    seen.add(channel.id)
-            await asyncio.sleep(0)
-        return found[:200]
-
-    async def _warm_channels(self, channels: list[discord.TextChannel]) -> tuple[int, int]:
-        warmed = 0
-        failed = 0
-        for channel in channels[:120]:
+        if SEND_STARTUP_PING:
             try:
-                await channel.history(limit=1).flatten()
-                warmed += 1
-                await asyncio.sleep(0.2)
-            except Exception:
-                failed += 1
-        return warmed, failed
-
-    async def _history_poll_loop(self) -> None:
-        await self.wait_until_ready()
-        await asyncio.sleep(10)
-        cycle = 0
-        while not self.is_closed():
-            cycle += 1
-            if not self._poll_channels and not self._setup_complete:
-                await asyncio.sleep(5)
-                continue
-            try:
-                await self._poll_channels_once(cycle)
+                await self._output_channel.send(build_startup_card(str(self.user)))
+                _log(str(self.user), "Startup card sent.")
             except Exception as exc:
-                _log(self.session_label, f"Poll error: {exc}")
-            await asyncio.sleep(HISTORY_POLL_SECONDS)
-
-    async def _poll_channels_once(self, cycle: int) -> None:
-        if not self._poll_channels:
-            self._poll_channels = await self._discover_channels()
-
-        scanned = 0
-        for channel in self._poll_channels:
-            try:
-                batch: list[discord.Message] = []
-                async for message in channel.history(limit=POLL_HISTORY_LIMIT):
-                    batch.append(message)
-                batch.sort(key=lambda m: m.created_at)
-                for message in batch:
-                    await self._process_message(message, source="poll")
-                scanned += 1
-                await asyncio.sleep(0.15)
-            except Exception:
-                pass
-
-        if cycle % 3 == 0:
-            _log(self.session_label, f"Poll cycle {cycle}: scanned {scanned} log channel(s).")
-
-    async def _heartbeat_loop(self) -> None:
-        await self.wait_until_ready()
-        while not self.is_closed():
-            await asyncio.sleep(300)
-            _log(
-                self.session_label,
-                f"Heartbeat: {self._messages_seen} messages seen, {self._captures} captures sent.",
-            )
+                _log(str(self.user), f"Startup send failed: {exc}")
 
     async def on_message(self, message: discord.Message):
-        await self._process_message(message, source="live")
-
-    def _is_live_capture(self, message: discord.Message) -> bool:
-        if self._monitor_from is None:
-            return True
-        return _utc(message.created_at) >= self._monitor_from
-
-    def _remember_message(self, message: discord.Message) -> None:
-        self._seen_ids.add(message.id)
-        if len(self._seen_ids) > 10000:
-            drop = len(self._seen_ids) - 8000
-            for mid in list(self._seen_ids)[:drop]:
-                self._seen_ids.discard(mid)
-
-    async def _process_message(self, message: discord.Message, source: str = "live") -> None:
         if message.id in self._seen_ids:
             return
+        self._seen_ids.add(message.id)
+        if len(self._seen_ids) > 8000:
+            self._seen_ids = set(list(self._seen_ids)[-4000:])
 
         if message.author and self.user and message.author.id == self.user.id:
-            self._remember_message(message)
             return
 
-        if not self._is_live_capture(message):
-            self._remember_message(message)
+        if self._monitor_from and _utc(message.created_at) < self._monitor_from:
             return
 
-        self._remember_message(message)
-        self._messages_seen += 1
         data, kind = extract_capture(message)
         if data is None:
             return
 
-        guild_name = message.guild.name if message.guild else "DM"
-        channel_name = getattr(message.channel, "name", "dm")
-        _log(
-            self.session_label,
-            f"Capture ({kind}) {data.get('username')} @ {guild_name}/#{channel_name} [{source}]",
-        )
-
-        channel = self._target_channel
+        channel = self._output_channel
         if channel is None:
             try:
                 channel = await self.fetch_channel(self.target_chat_id)
-                self._target_channel = channel
+                self._output_channel = channel
             except Exception as exc:
-                _log(self.session_label, f"Output chat unavailable: {exc}")
+                _log(str(self.user), f"Output chat unavailable: {exc}")
                 return
 
-        content = build_capture_message(data)
+        guild_name = message.guild.name if message.guild else "DM"
+        ch_name = getattr(message.channel, "name", "dm")
+        _log(
+            str(self.user),
+            f"Capture ({kind}) {data.get('username')} @ {guild_name}/#{ch_name}",
+        )
+
         try:
-            sent = await channel.send(content)
+            sent = await channel.send(build_capture_card(data))
             self._captures += 1
-            _log(self.session_label, f"Forwarded capture (id: {sent.id}, via {source}).")
+            _log(str(self.user), f"Forwarded (msg {sent.id}, total {self._captures}).")
         except Exception as exc:
-            _log(self.session_label, f"Send failed: {exc}")
-            try:
-                channel = await self.fetch_channel(self.target_chat_id)
-                self._target_channel = channel
-                sent = await channel.send(content)
-                self._captures += 1
-                _log(self.session_label, f"Retry send OK (id: {sent.id}).")
-            except Exception as retry_exc:
-                _log(self.session_label, f"Retry send failed: {retry_exc}")
+            _log(str(self.user), f"Forward failed: {exc}")
 
 
 async def main():
@@ -485,7 +309,7 @@ async def main():
     if not CHAT_ID:
         raise SystemExit("CHAT_ID_CLIENT_1 is not set.")
 
-    _log("engine", "Starting universal join client...")
+    _log("engine", "Starting passive join listener...")
     client = UniversalJoinClient(target_chat_id=CHAT_ID)
     await client.start(DISCORD_TOKEN)
 
