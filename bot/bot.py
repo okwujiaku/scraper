@@ -63,7 +63,11 @@ SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() i
     "1", "true", "yes", "on",
 )
 
-CHANNEL_KEYWORDS = ("welcome", "joins", "gate", "logs", "member", "general")
+CHANNEL_KEYWORDS = (
+    "welcome", "joins", "join", "gate", "logs", "log", "member", "members",
+    "general", "audit", "arrival", "new", "notify", "bot",
+)
+FETCH_CHANNEL_TIMEOUT = 30
 
 # discord.py / discord.py-self name this differently across versions
 _NATIVE_JOIN_TYPES: tuple[discord.MessageType, ...] = tuple(
@@ -141,10 +145,13 @@ def parse_custom_log(text: str) -> dict | None:
             "member join",
             "user joined",
             "joined the server",
+            "has joined",
+            "just joined",
         )
     )
+    title_join = "join" in lowered and "member" in lowered
 
-    if not (has_user and has_id and has_join):
+    if not (has_user and has_id and (has_join or title_join)):
         return None
 
     def from_regex(pattern: str):
@@ -251,6 +258,8 @@ class UniversalJoinClient(discord.Client):
         self._captures = 0
         self._messages_seen = 0
         self._monitor_from: datetime | None = None
+        self._ready_setup = False
+        self._setup_complete = False
 
     @property
     def session_label(self) -> str:
@@ -259,17 +268,24 @@ class UniversalJoinClient(discord.Client):
         return self._session_label
 
     async def on_ready(self):
+        if self._ready_setup:
+            return
+        self._ready_setup = True
+
         self._monitor_from = datetime.now(timezone.utc)
         self._session_label = str(self.user) if self.user else "client"
         _log(self.session_label, f"Logged in (id: {self.user.id})")
         _log(
             self.session_label,
-            f"Live capture window started at {_monitor_from.isoformat()} (only new joins after this).",
+            f"Live window: {_monitor_from.isoformat()} (only joins after bot start).",
         )
         _log(self.session_label, f"Monitoring {len(self.guilds)} server(s).")
 
         try:
-            self._target_channel = await self.fetch_channel(self.target_chat_id)
+            self._target_channel = await asyncio.wait_for(
+                self.fetch_channel(self.target_chat_id),
+                timeout=FETCH_CHANNEL_TIMEOUT,
+            )
             _log(
                 self.session_label,
                 f"Output chat: {self._target_channel} (id: {self.target_chat_id})",
@@ -280,15 +296,28 @@ class UniversalJoinClient(discord.Client):
             _log(self.session_label, f"Could not open output chat: {exc}")
             return
 
-        await asyncio.sleep(5)
-        self._poll_channels = await self._discover_channels()
-        warmed, failed = await self._warm_channels(self._poll_channels)
-        _log(
-            self.session_label,
-            f"Channels matched: {len(self._poll_channels)}, warmed: {warmed}, no access: {failed}",
-        )
+        self.loop.create_task(self._background_setup())
         self.loop.create_task(self._history_poll_loop())
         self.loop.create_task(self._heartbeat_loop())
+        _log(self.session_label, "Live listener active; channel warm-up running in background.")
+
+    async def _background_setup(self) -> None:
+        try:
+            await asyncio.sleep(3)
+            _log(self.session_label, "Discovering log channels...")
+            self._poll_channels = await self._discover_channels()
+            _log(
+                self.session_label,
+                f"Matched {len(self._poll_channels)} log channel(s); warming subscriptions...",
+            )
+            warmed, failed = await self._warm_channels(self._poll_channels)
+            self._setup_complete = True
+            _log(
+                self.session_label,
+                f"Ready: {len(self._poll_channels)} channels, warmed {warmed}, no access {failed}.",
+            )
+        except Exception as exc:
+            _log(self.session_label, f"Background setup error: {exc}")
 
     async def _send_startup_ping(self) -> None:
         if self._target_channel is None:
@@ -301,11 +330,14 @@ class UniversalJoinClient(discord.Client):
             _log(self.session_label, f"Startup message failed: {exc}")
 
     async def _guild_text_channels(self, guild: discord.Guild) -> list[discord.TextChannel]:
+        cached = [c for c in guild.text_channels if isinstance(c, discord.TextChannel)]
+        if cached:
+            return cached
         try:
-            fetched = await guild.fetch_channels()
+            fetched = await asyncio.wait_for(guild.fetch_channels(), timeout=12)
             return [c for c in fetched if isinstance(c, discord.TextChannel)]
         except Exception:
-            return list(guild.text_channels)
+            return cached
 
     def _channel_matches(self, channel: discord.TextChannel) -> bool:
         name = (channel.name or "").lower()
@@ -313,11 +345,16 @@ class UniversalJoinClient(discord.Client):
 
     async def _discover_channels(self) -> list[discord.TextChannel]:
         found: list[discord.TextChannel] = []
+        seen: set[int] = set()
         for guild in self.guilds:
             for channel in await self._guild_text_channels(guild):
+                if channel.id in seen:
+                    continue
                 if self._channel_matches(channel):
                     found.append(channel)
-        return found[:300]
+                    seen.add(channel.id)
+            await asyncio.sleep(0)
+        return found[:200]
 
     async def _warm_channels(self, channels: list[discord.TextChannel]) -> tuple[int, int]:
         warmed = 0
@@ -333,9 +370,13 @@ class UniversalJoinClient(discord.Client):
 
     async def _history_poll_loop(self) -> None:
         await self.wait_until_ready()
+        await asyncio.sleep(10)
         cycle = 0
         while not self.is_closed():
             cycle += 1
+            if not self._poll_channels and not self._setup_complete:
+                await asyncio.sleep(5)
+                continue
             try:
                 await self._poll_channels_once(cycle)
             except Exception as exc:
