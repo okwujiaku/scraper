@@ -20,6 +20,7 @@ import sys
 from datetime import datetime, timezone
 
 import discord
+from discord.http import handle_message_parameters
 from dotenv import load_dotenv
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -192,6 +193,18 @@ def parse_native_join(message: discord.Message) -> dict | None:
     }
 
 
+async def send_embed_message(
+    channel: discord.abc.Messageable,
+    embed: discord.Embed,
+) -> discord.Message:
+    """Send embed via HTTP payload (Messageable.send has no embed kwarg in discord.py-self)."""
+    target = await channel._get_channel()
+    state = channel._state
+    with handle_message_parameters(embed=embed) as params:
+        data = await state.http.send_message(target.id, params=params)
+    return state.create_message(channel=target, data=data)
+
+
 def build_capture_embed(data: dict) -> discord.Embed:
     date = data.get("date") or "N/A"
     time = data.get("time") or "N/A"
@@ -289,7 +302,7 @@ class UniversalJoinClient(discord.Client):
             color=EMBED_COLOR,
         )
         try:
-            await self._target_channel.send(embed=embed)
+            await send_embed_message(self._target_channel, embed)
             _log(self.session_label, "Startup embed sent.")
         except Exception as exc:
             _log(self.session_label, f"Startup embed failed: {exc}")
@@ -415,7 +428,7 @@ class UniversalJoinClient(discord.Client):
 
         embed = build_capture_embed(data)
         try:
-            sent = await channel.send(embed=embed)
+            sent = await send_embed_message(channel, embed)
             self._captures += 1
             _log(self.session_label, f"Forwarded embed (id: {sent.id}, via {source}).")
         except Exception as exc:
@@ -423,7 +436,7 @@ class UniversalJoinClient(discord.Client):
             try:
                 channel = await self.fetch_channel(self.target_chat_id)
                 self._target_channel = channel
-                sent = await channel.send(embed=embed)
+                sent = await send_embed_message(channel, embed)
                 self._captures += 1
                 _log(self.session_label, f"Retry embed OK (id: {sent.id}).")
             except Exception as retry_exc:
