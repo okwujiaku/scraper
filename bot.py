@@ -204,10 +204,59 @@ class CaptureRouter:
         self._lock = asyncio.Lock()
         self._delivered: dict[str, set[int]] = {}
         self._pending: list[tuple["ScraperClient", dict]] = []
+        self._report_scheduled = False
+        self._report_done = False
 
     def register(self, client: "ScraperClient") -> None:
         self._clients[client.client_index] = client
         asyncio.create_task(self._flush_pending())
+        if not self._report_scheduled:
+            self._report_scheduled = True
+            asyncio.create_task(self._print_pipeline_report_later())
+
+    async def _print_pipeline_report_later(self) -> None:
+        """Wait for slow accounts (e.g. Client 2) then print join checklist once."""
+        await asyncio.sleep(30)
+        if self._report_done or len(self._clients) < len(ACCOUNTS):
+            return
+        self._report_done = True
+        guilds_by_index = {
+            idx: {g.name for g in c.guilds} for idx, c in self._clients.items()
+        }
+        pikanto = guilds_by_index.get(1, set())
+
+        print("\n========== PIPELINE SETUP REPORT ==========", flush=True)
+        print(
+            "Join each account to the servers listed under 'MISSING'. "
+            "Use that account in Discord + accept the server invite.",
+            flush=True,
+        )
+
+        for account in ACCOUNTS:
+            if account["index"] == 1:
+                continue
+            idx = account["index"]
+            mine = guilds_by_index.get(idx, set())
+            others = set().union(
+                *(guilds_by_index[j] for j in guilds_by_index if j != idx)
+            )
+            exclusive = mine - others
+            missing = sorted(pikanto - mine)
+            shared_with_pikanto = mine & pikanto
+
+            print(f"\n--- {account['name']} → chat {account['chat_id']} ---", flush=True)
+            print(f"  Exclusive servers (only this account): {len(exclusive)}", flush=True)
+            print(f"  Shared with Pikanto (auto-routed here): {len(shared_with_pikanto)}", flush=True)
+            print(f"  MISSING — join with THIS account ({len(missing)} on Pikanto, not here):", flush=True)
+            if missing:
+                for name in missing[:30]:
+                    print(f"    • {name}", flush=True)
+                if len(missing) > 30:
+                    print(f"    ... and {len(missing) - 30} more", flush=True)
+            else:
+                print("    (none)", flush=True)
+
+        print("\n===========================================\n", flush=True)
 
     async def _flush_pending(self) -> None:
         await asyncio.sleep(0.5)
