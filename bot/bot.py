@@ -6,7 +6,8 @@ Deploy one Render Background Worker per customer. Each worker uses only:
   - CHAT_ID_CLIENT_1 (target group chat ID)
 
 Detects joins via custom log-bot text OR native Discord member-join messages,
-then forwards a premium embed card to the configured group chat.
+then forwards a premium markdown card to the configured group chat.
+(User accounts cannot send API embeds; formatted text is used instead.)
 
 WARNING: Automating a user account (self-botting) violates Discord's ToS.
 """
@@ -20,7 +21,6 @@ import sys
 from datetime import datetime, timezone
 
 import discord
-from discord.http import handle_message_parameters
 from dotenv import load_dotenv
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -63,8 +63,6 @@ SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() i
 )
 
 CHANNEL_KEYWORDS = ("welcome", "joins", "gate", "logs", "member", "general")
-
-EMBED_COLOR = 0x57F287
 
 # discord.py / discord.py-self name this differently across versions
 _NATIVE_JOIN_TYPES: tuple[discord.MessageType, ...] = tuple(
@@ -193,36 +191,27 @@ def parse_native_join(message: discord.Message) -> dict | None:
     }
 
 
-async def send_embed_message(
-    channel: discord.abc.Messageable,
-    embed: discord.Embed,
-) -> discord.Message:
-    """Send embed via HTTP payload (Messageable.send has no embed kwarg in discord.py-self)."""
-    target = await channel._get_channel()
-    state = channel._state
-    with handle_message_parameters(embed=embed) as params:
-        data = await state.http.send_message(target.id, params=params)
-    return state.create_message(channel=target, data=data)
+def build_capture_message(data: dict) -> str:
+    """Premium card as markdown (user tokens cannot send embeds on Discord's API)."""
+    lines = [
+        "🎉 **NEW MEMBER CAPTURED** 🎉",
+        f"📅 **Date:** {data.get('date') or 'N/A'}",
+        f"⏰ **Time:** {data.get('time') or 'N/A'}",
+        f"🆔 **User ID:** {data.get('user_id') or 'N/A'}",
+        f"👤 **Username:** `{data.get('username') or 'N/A'}`",
+        f"🏠 **Target Server:** {data.get('server_name') or 'N/A'}",
+        "",
+        "_Tap the username above to copy._",
+    ]
+    return "\n".join(lines) + "\n\u200b\n" + "─" * 30
 
 
-def build_capture_embed(data: dict) -> discord.Embed:
-    date = data.get("date") or "N/A"
-    time = data.get("time") or "N/A"
-    username = data.get("username") or "N/A"
-    user_id = data.get("user_id") or "N/A"
-    server_name = data.get("server_name") or "N/A"
-
-    embed = discord.Embed(
-        title="🎉 NEW MEMBER CAPTURED 🎉",
-        color=EMBED_COLOR,
+def build_startup_message(session_label: str, guild_count: int) -> str:
+    return (
+        "✅ **Scraper online**\n"
+        f"Session **{session_label}** is active.\n"
+        f"Monitoring **{guild_count}** server(s). New member captures will appear here."
     )
-    embed.add_field(name="📅 Date", value=date, inline=True)
-    embed.add_field(name="⏰ Time", value=time, inline=True)
-    embed.add_field(name="🆔 User ID", value=user_id, inline=False)
-    embed.add_field(name="👤 Username", value=f"`{username}`", inline=False)
-    embed.add_field(name="🏠 Target Server", value=server_name, inline=False)
-    embed.set_footer(text="Tap username to copy")
-    return embed
 
 
 def extract_capture(message: discord.Message) -> tuple[dict | None, str]:
@@ -292,20 +281,12 @@ class UniversalJoinClient(discord.Client):
     async def _send_startup_ping(self) -> None:
         if self._target_channel is None:
             return
-        embed = discord.Embed(
-            title="✅ Scraper online",
-            description=(
-                f"Session **{self.session_label}** is active.\n"
-                f"Monitoring **{len(self.guilds)}** server(s). "
-                f"New member captures will appear here."
-            ),
-            color=EMBED_COLOR,
-        )
         try:
-            await send_embed_message(self._target_channel, embed)
-            _log(self.session_label, "Startup embed sent.")
+            content = build_startup_message(self.session_label, len(self.guilds))
+            await self._target_channel.send(content)
+            _log(self.session_label, "Startup message sent.")
         except Exception as exc:
-            _log(self.session_label, f"Startup embed failed: {exc}")
+            _log(self.session_label, f"Startup message failed: {exc}")
 
     async def _guild_text_channels(self, guild: discord.Guild) -> list[discord.TextChannel]:
         try:
@@ -426,21 +407,21 @@ class UniversalJoinClient(discord.Client):
                 _log(self.session_label, f"Output chat unavailable: {exc}")
                 return
 
-        embed = build_capture_embed(data)
+        content = build_capture_message(data)
         try:
-            sent = await send_embed_message(channel, embed)
+            sent = await channel.send(content)
             self._captures += 1
-            _log(self.session_label, f"Forwarded embed (id: {sent.id}, via {source}).")
+            _log(self.session_label, f"Forwarded capture (id: {sent.id}, via {source}).")
         except Exception as exc:
-            _log(self.session_label, f"Embed send failed: {exc}")
+            _log(self.session_label, f"Send failed: {exc}")
             try:
                 channel = await self.fetch_channel(self.target_chat_id)
                 self._target_channel = channel
-                sent = await send_embed_message(channel, embed)
+                sent = await channel.send(content)
                 self._captures += 1
-                _log(self.session_label, f"Retry embed OK (id: {sent.id}).")
+                _log(self.session_label, f"Retry send OK (id: {sent.id}).")
             except Exception as retry_exc:
-                _log(self.session_label, f"Retry embed failed: {retry_exc}")
+                _log(self.session_label, f"Retry send failed: {retry_exc}")
 
 
 async def main():
