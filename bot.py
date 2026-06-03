@@ -106,12 +106,20 @@ def load_accounts():
                 "name": (os.getenv(f"NAME_CLIENT_{i}") or f"Client {i}").strip(),
                 "token": token,
                 "chat_id": chat_id,
+                "monitor_servers": load_monitor_servers(i),
             }
         )
     return accounts
 
 
+def load_monitor_servers(client_index: int) -> list[str]:
+    """Server name fragments routed to this client's group chat."""
+    raw = (os.getenv(f"MONITOR_SERVERS_CLIENT_{client_index}") or "").strip()
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
 ACCOUNTS = load_accounts()
+USE_SERVER_ROUTING = any(account["monitor_servers"] for account in ACCOUNTS)
 
 
 # ---------------------------------------------------------------------------
@@ -190,19 +198,152 @@ def build_message(data: dict) -> str:
     return "\n".join(card) + "\n\u200b\n" + "─" * 30
 
 
+def is_join_log(text: str) -> bool:
+    """Match log-bot join messages (case-insensitive, minor wording variants)."""
+    lowered = text.lower()
+    return (
+        "username:" in lowered
+        and "user id:" in lowered
+        and ("new member joined" in lowered or "member joined!" in lowered)
+    )
+
+
+def parse_join_log(full_text: str) -> dict | None:
+    """Extract join fields from a log-bot message, or return None."""
+    if not is_join_log(full_text):
+        return None
+
+    date_match = re.search(r"Date:\s*(.+)", full_text, re.IGNORECASE)
+    time_match = re.search(r"Time:\s*(.+)", full_text, re.IGNORECASE)
+    username_match = re.search(r"Username:\s*(.+)", full_text, re.IGNORECASE)
+    server_match = re.search(r"Server:\s*(.+)", full_text, re.IGNORECASE)
+    user_id_match = re.search(r"User ID:\s*(.+)", full_text, re.IGNORECASE)
+
+    def clean(match):
+        if not match:
+            return None
+        return match.group(1).strip().replace("**", "").replace("`", "").strip()
+
+    return {
+        "date": clean(date_match),
+        "time": clean(time_match),
+        "username": clean(username_match),
+        "server_name": clean(server_match),
+        "user_id": clean(user_id_match),
+    }
+
+
 # ---------------------------------------------------------------------------
-# DISCORD CLIENT
+# CAPTURE DISPATCHER
 # ---------------------------------------------------------------------------
+
+class CaptureDispatcher:
+    """Route captures to the correct group chat based on target server name.
+
+    Any connected account may *detect* a join, but the message is always sent by
+    the account that owns that client's group chat. This lets Client 1 see joins
+    across many servers while Stevo/Emenite groups only get their own servers.
+    """
+
+    def __init__(self):
+        self._clients: dict[int, "ScraperClient"] = {}
+        self._lock = asyncio.Lock()
+        self._delivered: dict[str, set[int]] = {}
+
+    def register(self, client: "ScraperClient") -> None:
+        self._clients[client.client_index] = client
+
+    def resolve_owner(self, server_name: str) -> dict | None:
+        if not server_name:
+            return None
+        lowered = server_name.lower()
+        for account in ACCOUNTS:
+            for pattern in account["monitor_servers"]:
+                if pattern.lower() in lowered:
+                    return account
+        return None
+
+    async def handle_capture(self, source: "ScraperClient", data: dict) -> None:
+        server = data.get("server_name") or ""
+        username = data.get("username") or "unknown"
+        dedup_key = f"{data.get('user_id')}:{server}:{username}"
+
+        if USE_SERVER_ROUTING:
+            owner_account = self.resolve_owner(server)
+            if owner_account is None:
+                print(
+                    f"[{source.name}] No route for server {server!r} "
+                    f"(set MONITOR_SERVERS_CLIENT_N on Render).",
+                    flush=True,
+                )
+                return
+            owner = self._clients.get(owner_account["index"])
+            chat_id = owner_account["chat_id"]
+            label = owner_account["name"]
+        else:
+            owner_account = next(
+                (a for a in ACCOUNTS if a["index"] == source.client_index), None
+            )
+            owner = source
+            chat_id = source.target_chat_id
+            label = source.name
+
+        if owner is None or not chat_id:
+            print(f"[{label}] Route owner not ready yet.", flush=True)
+            return
+
+        async with self._lock:
+            if chat_id in self._delivered.get(dedup_key, set()):
+                return
+
+        try:
+            await owner.send_capture(data)
+        except Exception as exc:
+            print(f"[{label}] Failed to send to chat {chat_id}: {exc}", flush=True)
+            return
+
+        async with self._lock:
+            self._delivered.setdefault(dedup_key, set()).add(chat_id)
+            if len(self._delivered) > 500:
+                self._delivered.clear()
+
+        if source.client_index != owner.client_index:
+            print(
+                f"[{label}] Forwarded capture for {username} "
+                f"(server: {server}, seen by {source.name}).",
+                flush=True,
+            )
+        else:
+            print(f"[{label}] Forwarded capture for {username}.", flush=True)
+
+
+DISPATCHER = CaptureDispatcher()
 
 class ScraperClient(discord.Client):
-    """A self-bot instance that scrapes join events and forwards them only to
-    its own dedicated group chat."""
+    """A self-bot that detects join logs and dispatches them to the right group."""
 
-    def __init__(self, name: str, target_chat_id: int, *args, **kwargs):
+    def __init__(
+        self,
+        name: str,
+        client_index: int,
+        target_chat_id: int,
+        monitor_servers: list[str],
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.name = name
+        self.client_index = client_index
         self.target_chat_id = target_chat_id
+        self.monitor_servers = monitor_servers
         self._target_channel = None
+
+    async def send_capture(self, data: dict) -> None:
+        channel = self._target_channel
+        if channel is None:
+            channel = await self.fetch_channel(self.target_chat_id)
+            self._target_channel = channel
+        await channel.send(build_message(data))
 
     async def on_ready(self):
         print(f"[{self.name}] Logged in as {self.user} (id: {self.user.id})", flush=True)
@@ -211,13 +352,31 @@ class ScraperClient(discord.Client):
             flush=True,
         )
 
+        guild_names = sorted(g.name for g in self.guilds)
+        preview = ", ".join(guild_names[:12])
+        if len(guild_names) > 12:
+            preview += f", ... (+{len(guild_names) - 12} more)"
+        print(f"[{self.name}] Servers: {preview}", flush=True)
+
         if not self.target_chat_id:
             print(f"[{self.name}] No target chat ID configured; will capture but not forward.", flush=True)
             return
 
         try:
             self._target_channel = await self.fetch_channel(self.target_chat_id)
+            DISPATCHER.register(self)
             print(f"[{self.name}] Forwarding captures to: {self._target_channel}", flush=True)
+            if self.monitor_servers:
+                print(
+                    f"[{self.name}] Routed servers: {', '.join(self.monitor_servers)}",
+                    flush=True,
+                )
+            elif USE_SERVER_ROUTING:
+                print(
+                    f"[{self.name}] No MONITOR_SERVERS_CLIENT_{self.client_index} set; "
+                    f"this account will not own any routes.",
+                    flush=True,
+                )
         except Exception as exc:
             print(
                 f"[{self.name}] Could not open target chat {self.target_chat_id}: {exc}",
@@ -241,57 +400,12 @@ class ScraperClient(discord.Client):
                 parts.append(field.value or "")
 
         full_text = "\n".join(parts)
+        data = parse_join_log(full_text)
+        if data is None:
+            return
 
-        # Key off the distinctive label phrases inside the combined text.
-        if "Username:" in full_text and "User ID:" in full_text and "New Member Joined!" in full_text:
-            date_match = re.search(r"Date:\s*(.+)", full_text)
-            time_match = re.search(r"Time:\s*(.+)", full_text)
-            username_match = re.search(r"Username:\s*(.+)", full_text)
-            server_match = re.search(r"Server:\s*(.+)", full_text)
-            user_id_match = re.search(r"User ID:\s*(.+)", full_text)
-
-            def clean(match):
-                # Strip Discord markdown clutter (** bold and ` code) from a value.
-                if not match:
-                    return None
-                return match.group(1).strip().replace("**", "").replace("`", "").strip()
-
-            data = {
-                "date": clean(date_match),
-                "time": clean(time_match),
-                "username": clean(username_match),
-                "server_name": clean(server_match),
-                "user_id": clean(user_id_match),
-            }
-
-            process_extracted_data(data, client_name=self.name)
-
-            if not self.target_chat_id:
-                return
-
-            channel = self._target_channel
-            if channel is None:
-                try:
-                    channel = await self.fetch_channel(self.target_chat_id)
-                    self._target_channel = channel
-                except Exception as exc:
-                    print(
-                        f"[{self.name}] Could not find target chat {self.target_chat_id}: {exc}",
-                        flush=True,
-                    )
-                    return
-
-            try:
-                await channel.send(build_message(data))
-                print(
-                    f"[{self.name}] Forwarded capture for {data.get('username') or 'unknown'}.",
-                    flush=True,
-                )
-            except Exception as exc:
-                print(
-                    f"[{self.name}] Failed to send to chat {self.target_chat_id}: {exc}",
-                    flush=True,
-                )
+        process_extracted_data(data, client_name=self.name)
+        await DISPATCHER.handle_capture(self, data)
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +416,9 @@ async def run_client(account: dict):
     """Start one account; keep other accounts running if this one fails."""
     client = ScraperClient(
         name=account["name"],
+        client_index=account["index"],
         target_chat_id=account["chat_id"],
+        monitor_servers=account["monitor_servers"],
     )
     try:
         await client.start(account["token"])
@@ -335,6 +451,21 @@ async def main():
         tasks.append(asyncio.create_task(run_client(account)))
 
     print(f"Launching {len(tasks)} account(s)...", flush=True)
+    if USE_SERVER_ROUTING:
+        print("Server routing enabled (MONITOR_SERVERS_CLIENT_N):", flush=True)
+        for account in ACCOUNTS:
+            if account["monitor_servers"]:
+                print(
+                    f"  {account['name']} → chat {account['chat_id']}: "
+                    f"{', '.join(account['monitor_servers'])}",
+                    flush=True,
+                )
+    else:
+        print(
+            "Server routing disabled. Each client only forwards what it sees. "
+            "Add MONITOR_SERVERS_CLIENT_N on Render to route by server name.",
+            flush=True,
+        )
     await asyncio.gather(*tasks)
 
 
