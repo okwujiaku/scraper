@@ -304,7 +304,8 @@ class ScraperClient(discord.Client):
     async def _guild_text_channels(self, guild: discord.Guild) -> list[discord.TextChannel]:
         channels: list[discord.TextChannel] = []
         try:
-            async for channel in guild.fetch_channels():
+            fetched = await guild.fetch_channels()
+            for channel in fetched:
                 if isinstance(channel, discord.TextChannel):
                     channels.append(channel)
         except Exception:
