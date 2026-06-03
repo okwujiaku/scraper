@@ -249,7 +249,8 @@ class PikantoScraper(discord.Client):
             warmed = 0
             for channel in self._log_channels:
                 try:
-                    await channel.history(limit=1).flatten()
+                    async for _ in channel.history(limit=1):
+                        break
                     warmed += 1
                     await asyncio.sleep(0.15)
                 except Exception:
