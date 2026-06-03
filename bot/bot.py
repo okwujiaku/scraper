@@ -1,8 +1,12 @@
 """
-Option C text-channel join scraper (unprivileged self-bot).
+Option C join scraper — Pikanto production model.
 
-Passive on_message only — no admin permissions, no on_member_join, no channel scans.
-Captures log-bot text (Username:, Server:) and native system join messages in channels.
+Unprivileged self-bot: reads welcome/log-bot messages in text channels (no admin).
+  • Live on_message
+  • Light log-channel activation (opens channels so Discord delivers events)
+  • Small background poll on log channels only (catches missed live events)
+
+One DISCORD_TOKEN + one CHAT_ID_CLIENT_1 per Render worker / paying customer.
 
 WARNING: Automating a user account (self-botting) violates Discord's ToS.
 """
@@ -50,6 +54,14 @@ CHAT_ID = int(
 SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
+POLL_SECONDS = int((os.getenv("POLL_SECONDS") or "45").strip() or 45)
+POLL_LIMIT = int((os.getenv("POLL_LIMIT") or "5").strip() or 5)
+MAX_LOG_CHANNELS = int((os.getenv("MAX_LOG_CHANNELS") or "120").strip() or 120)
+
+LOG_CHANNEL_KEYWORDS = (
+    "welcome", "joins", "join", "gate", "logs", "log", "member", "members",
+    "audit", "arrival", "new", "notify", "bot", "general",
+)
 
 _NATIVE_JOIN_TYPES: tuple[discord.MessageType, ...] = tuple(
     t
@@ -91,8 +103,26 @@ def collect_message_text(message: discord.Message) -> str:
 
 
 def parse_log_message(text: str) -> dict | None:
+    """Match Smart Tech / welcome-bot join logs (Pikanto-style)."""
     lowered = text.lower()
-    if "username:" not in lowered or "server:" not in lowered:
+    if "username:" not in lowered:
+        return None
+    if "server:" not in lowered and "target server:" not in lowered:
+        return None
+
+    has_join = any(
+        p in lowered
+        for p in (
+            "new member joined",
+            "member joined",
+            "member join",
+            "user joined",
+            "joined the server",
+            "has joined",
+        )
+    )
+    title_join = "join" in lowered and "member" in lowered
+    if not (has_join or title_join):
         return None
 
     fields: dict[str, str] = {}
@@ -140,12 +170,10 @@ def parse_system_join(message: discord.Message) -> dict | None:
         return None
     if not message.author:
         return None
-
-    server_name = message.guild.name if message.guild else "Unknown"
     return {
         "username": message.author.display_name or str(message.author),
         "user_id": str(message.author.id),
-        "server_name": server_name,
+        "server_name": message.guild.name if message.guild else "Unknown",
     }
 
 
@@ -179,26 +207,105 @@ def build_startup_message(session_label: str, ts: int) -> str:
     )
 
 
-class TextChannelScraper(discord.Client):
+class PikantoScraper(discord.Client):
+    """One paying customer = one token + one output group chat."""
+
     def __init__(self, output_chat_id: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.output_chat_id = output_chat_id
         self._output_channel: discord.abc.Messageable | None = None
         self._ready_once = False
         self._live_after: datetime | None = None
-        self._recent: set[tuple[str, str]] = set()
+        self._log_channels: list[discord.TextChannel] = []
+        self._seen_message_ids: set[int] = set()
+        self._recent_joins: set[tuple[str, str]] = set()
         self._send_lock = asyncio.Lock()
+        self._captures = 0
+        self._messages_seen = 0
 
-    def _dedup_key(self, user_id: str, server_name: str) -> tuple[str, str]:
+    def _channel_is_log(self, channel: discord.TextChannel) -> bool:
+        name = (channel.name or "").lower()
+        return any(k in name for k in LOG_CHANNEL_KEYWORDS)
+
+    def _discover_log_channels(self) -> list[discord.TextChannel]:
+        found: list[discord.TextChannel] = []
+        seen: set[int] = set()
+        for guild in self.guilds:
+            for channel in guild.text_channels:
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+                if channel.id in seen:
+                    continue
+                if self._channel_is_log(channel):
+                    found.append(channel)
+                    seen.add(channel.id)
+                if len(found) >= MAX_LOG_CHANNELS:
+                    return found
+        return found
+
+    async def _activate_log_channels(self) -> None:
+        try:
+            self._log_channels = self._discover_log_channels()
+            warmed = 0
+            for channel in self._log_channels:
+                try:
+                    await channel.history(limit=1).flatten()
+                    warmed += 1
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    pass
+            _log(
+                f"[Ready] Log channels: {len(self._log_channels)} matched, "
+                f"{warmed} opened for live events."
+            )
+        except Exception as exc:
+            _log(f"[Error] Log channel activation failed: {exc}")
+
+    async def _poll_log_channels(self) -> None:
+        if not self._log_channels:
+            self._log_channels = self._discover_log_channels()
+        for channel in self._log_channels:
+            try:
+                batch: list[discord.Message] = []
+                async for message in channel.history(limit=POLL_LIMIT):
+                    batch.append(message)
+                batch.sort(key=lambda m: m.created_at)
+                for message in batch:
+                    await self._handle_message(message, source="poll")
+                await asyncio.sleep(0.12)
+            except Exception:
+                pass
+
+    async def _poll_loop(self) -> None:
+        await self.wait_until_ready()
+        await asyncio.sleep(8)
+        while not self.is_closed():
+            try:
+                await self._poll_log_channels()
+            except Exception as exc:
+                _log(f"[Error] Poll loop: {exc}")
+            await asyncio.sleep(POLL_SECONDS)
+
+    async def _heartbeat_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(180)
+            _log(
+                f"[Heartbeat] {self._messages_seen} msgs seen, "
+                f"{self._captures} captures, "
+                f"{len(self._log_channels)} log channels."
+            )
+
+    def _join_key(self, user_id: str, server_name: str) -> tuple[str, str]:
         return (str(user_id), str(server_name).strip().lower())
 
-    def _mark_sent(self, user_id: str, server_name: str) -> bool:
-        key = self._dedup_key(user_id, server_name)
-        if key in self._recent:
+    def _already_forwarded_join(self, user_id: str, server_name: str) -> bool:
+        key = self._join_key(user_id, server_name)
+        if key in self._recent_joins:
             return True
-        self._recent.add(key)
-        if len(self._recent) > 500:
-            self._recent = set(list(self._recent)[-300:])
+        self._recent_joins.add(key)
+        if len(self._recent_joins) > 500:
+            self._recent_joins = set(list(self._recent_joins)[-300:])
         return False
 
     async def on_ready(self):
@@ -208,7 +315,7 @@ class TextChannelScraper(discord.Client):
         self._live_after = datetime.now(timezone.utc)
 
         _log(f"[Success] Logged in as {self.user}")
-        _log(f"[Ready] Monitoring {len(self.guilds)} server(s) — passive text only.")
+        _log(f"[Ready] Monitoring {len(self.guilds)} server(s) (live + log channels).")
 
         try:
             self._output_channel = await asyncio.wait_for(
@@ -231,6 +338,10 @@ class TextChannelScraper(discord.Client):
             except Exception as exc:
                 _log(f"[Error] Startup failed: {exc}")
 
+        self.loop.create_task(self._activate_log_channels())
+        self.loop.create_task(self._poll_loop())
+        self.loop.create_task(self._heartbeat_loop())
+
     async def _forward(
         self,
         *,
@@ -241,8 +352,8 @@ class TextChannelScraper(discord.Client):
         source: str,
     ) -> None:
         async with self._send_lock:
-            if self._mark_sent(user_id, server_name):
-                _log(f"[Skip] Duplicate: {username} @ {server_name}")
+            if self._already_forwarded_join(user_id, server_name):
+                _log(f"[Skip] Duplicate join: {username} @ {server_name}")
                 return
 
             channel = self._output_channel
@@ -258,33 +369,44 @@ class TextChannelScraper(discord.Client):
                 msg = await channel.send(
                     build_alert_message(username, user_id, server_name, ts)
                 )
+                self._captures += 1
                 _log(f"[Sent] {username} → {server_name} via {source} (msg {msg.id})")
             except Exception as exc:
-                self._recent.discard(self._dedup_key(user_id, server_name))
+                self._recent_joins.discard(self._join_key(user_id, server_name))
                 _log(f"[Error] Send failed: {exc}")
 
-    async def on_message(self, message: discord.Message):
+    async def _handle_message(self, message: discord.Message, source: str) -> None:
         if self._live_after is None:
             return
+        if message.id in self._seen_message_ids:
+            return
+        self._seen_message_ids.add(message.id)
+        if len(self._seen_message_ids) > 10000:
+            self._seen_message_ids = set(list(self._seen_message_ids)[-6000:])
+
         if message.author and self.user and message.author.id == self.user.id:
             return
         if _utc(message.created_at) < self._live_after:
             return
 
+        self._messages_seen += 1
         data = extract_capture(message)
         if data is None:
             return
 
-        source = "system_join" if message.type in _NATIVE_JOIN_TYPES else "log_text"
-        ts = _unix(message.created_at)
-
+        capture_source = (
+            "system_join" if message.type in _NATIVE_JOIN_TYPES else "log_text"
+        )
         await self._forward(
             username=data["username"],
             user_id=str(data["user_id"]),
             server_name=data["server_name"],
-            ts=ts,
-            source=source,
+            ts=_unix(message.created_at),
+            source=f"{capture_source}/{source}",
         )
+
+    async def on_message(self, message: discord.Message):
+        await self._handle_message(message, source="live")
 
 
 async def main():
@@ -293,8 +415,8 @@ async def main():
     if not CHAT_ID:
         raise SystemExit("CHAT_ID_CLIENT_1 is not set.")
 
-    _log("[Engine] Starting text-channel join scraper...")
-    client = TextChannelScraper(output_chat_id=CHAT_ID)
+    _log("[Engine] Starting Pikanto-style join scraper...")
+    client = PikantoScraper(output_chat_id=CHAT_ID)
     await client.start(DISCORD_TOKEN)
 
 
