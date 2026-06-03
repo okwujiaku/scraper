@@ -1,6 +1,12 @@
 # Set these in Render → your Background Worker → Environment
 
+CLIENT_INDEX=1
 TOKEN=
 CHAT_ID=
+# Or use numbered vars (set CLIENT_INDEX to match):
+# TOKEN_CLIENT_2=
+# CHAT_ID_CLIENT_2=
+
 CLIENT_NAME=Customer Name
 PYTHON_VERSION=3.11.9
+# DEBUG_JOIN_LOGS=true

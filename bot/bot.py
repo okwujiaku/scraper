@@ -47,16 +47,46 @@ except Exception:
 
 load_dotenv()
 
-DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or "").strip()
-CHAT_ID = int(
-    (os.getenv("CHAT_ID_CLIENT_1") or os.getenv("CHAT_ID") or "0").strip() or 0
-)
+
+def _client_index() -> int:
+    raw = (os.getenv("CLIENT_INDEX") or "1").strip()
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+def _load_credentials(index: int) -> tuple[str, int, str]:
+    """One worker = one account. Use CLIENT_INDEX on Render for client 2–4."""
+    token = (
+        (os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or "").strip()
+        or (os.getenv(f"TOKEN_CLIENT_{index}") or "").strip()
+    )
+    chat_raw = (
+        (os.getenv(f"CHAT_ID_CLIENT_{index}") or "").strip()
+        or (os.getenv("CHAT_ID") or "").strip()
+        or (os.getenv("CHAT_ID_CLIENT_1") or "").strip()
+        or "0"
+    )
+    label = (
+        (os.getenv("CLIENT_NAME") or os.getenv(f"NAME_CLIENT_{index}") or "")
+        .strip()
+        or f"client-{index}"
+    )
+    return token, int(chat_raw or 0), label
+
+
+CLIENT_INDEX = _client_index()
+DISCORD_TOKEN, CHAT_ID, CLIENT_LABEL = _load_credentials(CLIENT_INDEX)
 SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
 POLL_SECONDS = int((os.getenv("POLL_SECONDS") or "45").strip() or 45)
 POLL_LIMIT = int((os.getenv("POLL_LIMIT") or "5").strip() or 5)
 MAX_LOG_CHANNELS = int((os.getenv("MAX_LOG_CHANNELS") or "120").strip() or 120)
+DEBUG_JOIN_LOGS = (os.getenv("DEBUG_JOIN_LOGS") or "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 LOG_CHANNEL_KEYWORDS = (
     "welcome", "joins", "join", "gate", "logs", "log", "member", "members",
@@ -87,7 +117,63 @@ def _unix(dt: datetime) -> int:
     return int(_utc(dt).timestamp())
 
 
+_JOIN_PHRASES = (
+    "new member joined",
+    "member joined!",
+    "member joined",
+    "member join",
+    "user joined",
+    "joined the server",
+    "has joined",
+)
+
+_FIELD_KEY_ALIASES: dict[str, str] = {
+    "username": "username",
+    "user": "username",
+    "user id": "user_id",
+    "userid": "user_id",
+    "discord id": "user_id",
+    "id": "user_id",
+    "server": "server_name",
+    "target server": "server_name",
+    "server name": "server_name",
+    "guild": "server_name",
+    "guild name": "server_name",
+}
+
+
+def _strip_md(value: str) -> str:
+    return value.strip().replace("**", "").replace("`", "").strip()
+
+
+def _normalize_field_key(name: str) -> str:
+    key = re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+    return _FIELD_KEY_ALIASES.get(key, key)
+
+
+def _regex_field(text: str, pattern: str) -> str | None:
+    match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return None
+    return _strip_md(match.group(1))
+
+
+def _looks_like_join_log(text: str) -> bool:
+    lowered = text.lower()
+    has_join = any(p in lowered for p in _JOIN_PHRASES)
+    has_join = has_join or ("join" in lowered and "member" in lowered)
+    if not has_join:
+        return False
+    has_user = (
+        "username:" in lowered
+        or "username" in lowered
+        or bool(re.search(r"username\s*[:：]", text, re.IGNORECASE))
+    )
+    return has_user
+
+
 def collect_message_text(message: discord.Message) -> str:
+    """Flatten content + embeds. Embed fields use 'Name: value' (required for parsing)."""
     parts = [message.content or ""]
     for embed in message.embeds:
         parts.append(embed.title or "")
@@ -97,72 +183,86 @@ def collect_message_text(message: discord.Message) -> str:
         if embed.footer:
             parts.append(embed.footer.text or "")
         for field in embed.fields:
-            parts.append(field.name or "")
-            parts.append(field.value or "")
+            name = (field.name or "").strip()
+            value = (field.value or "").strip()
+            if name and value:
+                parts.append(f"{name}: {value}")
+            else:
+                parts.append(name)
+                parts.append(value)
     return "\n".join(parts)
 
 
-def parse_log_message(text: str) -> dict | None:
-    """Match Smart Tech / welcome-bot join logs (Pikanto-style)."""
-    lowered = text.lower()
-    if "username:" not in lowered:
-        return None
-    if "server:" not in lowered and "target server:" not in lowered:
-        return None
-
-    has_join = any(
-        p in lowered
-        for p in (
-            "new member joined",
-            "member joined",
-            "member join",
-            "user joined",
-            "joined the server",
-            "has joined",
-        )
-    )
-    title_join = "join" in lowered and "member" in lowered
-    if not (has_join or title_join):
-        return None
-
-    fields: dict[str, str] = {}
-    for line in text.splitlines():
-        if ":" not in line:
-            continue
-        key, _, value = line.partition(":")
-        key = key.strip().lower().replace("**", "").replace("`", "")
-        value = value.strip().replace("**", "").replace("`", "")
-        if key and value:
-            fields[key] = value
-
-    def from_regex(pattern: str) -> str | None:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if not match:
-            return None
-        return match.group(1).strip().replace("**", "").replace("`", "")
-
-    username = fields.get("username") or from_regex(r"Username:\s*(.+)")
+def _parse_field_map(field_map: dict[str, str], text: str) -> dict | None:
+    username = field_map.get("username") or _regex_field(text, r"Username\s*[:：]\s*(.+)")
     user_id = (
-        fields.get("user id")
-        or fields.get("userid")
-        or from_regex(r"User\s*ID:\s*(\d+)")
+        field_map.get("user_id")
+        or _regex_field(text, r"User\s*ID\s*[:：]\s*(\d+)")
+        or _regex_field(text, r"User\s*ID\s*[:：]\s*(.+)")
     )
     server_name = (
-        fields.get("server")
-        or fields.get("target server")
-        or fields.get("server name")
-        or from_regex(r"Server:\s*(.+)")
-        or from_regex(r"Target\s+Server:\s*(.+)")
+        field_map.get("server_name")
+        or _regex_field(text, r"Target\s+Server\s*[:：]\s*(.+)")
+        or _regex_field(text, r"Server\s*Name\s*[:：]\s*(.+)")
+        or _regex_field(text, r"Server\s*[:：]\s*(.+)")
     )
-
-    if not username or not server_name:
+    if not username:
         return None
-
+    if not server_name:
+        return None
     return {
         "username": username,
         "user_id": user_id or "N/A",
         "server_name": server_name,
     }
+
+
+def parse_embed_fields(message: discord.Message) -> dict | None:
+    """Read Username / User ID / Server directly from embed field names."""
+    if not message.embeds:
+        return None
+
+    field_map: dict[str, str] = {}
+    blob_parts = [message.content or ""]
+    for embed in message.embeds:
+        blob_parts.extend([embed.title or "", embed.description or ""])
+        for field in embed.fields:
+            name = (field.name or "").strip()
+            value = _strip_md(field.value or "")
+            if name:
+                blob_parts.append(name)
+            if value:
+                blob_parts.append(value)
+            canon = _normalize_field_key(name)
+            if canon and value:
+                field_map[canon] = value
+
+    blob = "\n".join(blob_parts)
+    has_join = any(p in blob.lower() for p in _JOIN_PHRASES) or (
+        "join" in blob.lower() and "member" in blob.lower()
+    )
+    if not has_join or "username" not in field_map:
+        return None
+    return _parse_field_map(field_map, blob)
+
+
+def parse_log_message(text: str) -> dict | None:
+    """Match log-bot join messages (plain text and colon-separated embed flattening)."""
+    if not _looks_like_join_log(text):
+        return None
+
+    line_fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if ":" not in line and "：" not in line:
+            continue
+        sep = ":" if ":" in line else "："
+        key, _, value = line.partition(sep)
+        key = _normalize_field_key(key)
+        value = _strip_md(value)
+        if key and value:
+            line_fields[key] = value
+
+    return _parse_field_map(line_fields, text)
 
 
 def parse_system_join(message: discord.Message) -> dict | None:
@@ -181,6 +281,9 @@ def extract_capture(message: discord.Message) -> dict | None:
     system = parse_system_join(message)
     if system:
         return system
+    data = parse_embed_fields(message)
+    if data:
+        return data
     return parse_log_message(collect_message_text(message))
 
 
@@ -315,7 +418,7 @@ class PikantoScraper(discord.Client):
         self._ready_once = True
         self._live_after = datetime.now(timezone.utc)
 
-        _log(f"[Success] Logged in as {self.user}")
+        _log(f"[Success] Logged in as {self.user} ({CLIENT_LABEL}, client #{CLIENT_INDEX})")
         _log(f"[Ready] Monitoring {len(self.guilds)} server(s) (live + log channels).")
 
         try:
@@ -323,19 +426,22 @@ class PikantoScraper(discord.Client):
                 self.fetch_channel(self.output_chat_id),
                 timeout=30,
             )
-            _log(f"[Ready] Output chat: {self._output_channel}")
+            _log(
+                f"[Ready] Output chat: {self._output_channel} "
+                f"(id: {self.output_chat_id})"
+            )
         except Exception as exc:
-            _log(f"[Error] Could not open output chat: {exc}")
+            _log(f"[Error] Could not open output chat {self.output_chat_id}: {exc}")
             return
 
         if SEND_STARTUP_PING:
             try:
                 ts = _unix(datetime.now(timezone.utc))
                 async with self._send_lock:
-                    await self._output_channel.send(
+                    sent = await self._output_channel.send(
                         build_startup_message(str(self.user), ts)
                     )
-                _log("[Ready] Startup message sent.")
+                _log(f"[Ready] Startup message sent (msg id: {sent.id}).")
             except Exception as exc:
                 _log(f"[Error] Startup failed: {exc}")
 
@@ -393,6 +499,12 @@ class PikantoScraper(discord.Client):
         self._messages_seen += 1
         data = extract_capture(message)
         if data is None:
+            if DEBUG_JOIN_LOGS and message.guild:
+                text = collect_message_text(message)
+                low = text.lower()
+                if "username:" in low or "joined" in low:
+                    preview = (text[:120] + "...") if len(text) > 120 else text
+                    _log(f"[Debug] Not a join capture ({source}): {preview!r}")
             return
 
         capture_source = (
@@ -416,7 +528,10 @@ async def main():
     if not CHAT_ID:
         raise SystemExit("CHAT_ID_CLIENT_1 is not set.")
 
-    _log("[Engine] Starting Pikanto-style join scraper...")
+    _log(
+        f"[Engine] Starting join scraper ({CLIENT_LABEL}, "
+        f"output id {CHAT_ID})..."
+    )
     client = PikantoScraper(output_chat_id=CHAT_ID)
     await client.start(DISCORD_TOKEN)
 
