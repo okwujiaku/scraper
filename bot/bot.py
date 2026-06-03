@@ -52,7 +52,7 @@ SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() i
 # Only forward joins that happened within this many seconds (blocks guild-sync replays)
 MAX_JOIN_AGE_SECONDS = int((os.getenv("MAX_JOIN_AGE_SECONDS") or "120").strip() or 120)
 
-_CARD_DIVIDER = "\n\u200b\n" + "─" * 30 + "\n"
+CARD_SEPARATOR = "\n----------------------------------------\n"
 
 
 def _log(msg: str) -> None:
@@ -92,7 +92,6 @@ def build_capture_message(
         f"🏠 **Server:** {server_name}\n"
         f"\n"
         f"🎉 **New Member Joined!**"
-        f"{_CARD_DIVIDER}"
     )
 
 
@@ -106,8 +105,14 @@ def build_startup_message(session_label: str) -> str:
         f"📅 **Date:** {date_str}\n"
         f"\n"
         f"🕒 **Time:** {time_str}"
-        f"{_CARD_DIVIDER}"
     )
+
+
+async def dispatch_card(channel: discord.abc.Messageable, content: str) -> discord.Message:
+    """Send card then a separate divider message for clean spacing in chat."""
+    msg = await channel.send(content)
+    await channel.send(CARD_SEPARATOR)
+    return msg
 
 
 def is_realtime_join(member: discord.Member, live_after: datetime) -> bool:
