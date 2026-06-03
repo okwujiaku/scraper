@@ -1,0 +1,6 @@
+# Set these in Render → your Background Worker → Environment
+
+TOKEN=
+CHAT_ID=
+CLIENT_NAME=Customer Name
+PYTHON_VERSION=3.11.9
