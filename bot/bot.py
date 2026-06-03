@@ -60,6 +60,10 @@ load_dotenv()
 TOKEN = (os.getenv("TOKEN") or "").strip()
 CHAT_ID = int((os.getenv("CHAT_ID") or "0").strip() or 0)
 CLIENT_NAME = (os.getenv("CLIENT_NAME") or "scraper").strip()
+# Sends one message on startup so you can confirm the group chat works (set false to disable).
+SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 FIELD_STYLE = [
     ("Date",          "date",        "📅", C.CYAN),
@@ -119,11 +123,18 @@ def build_message(data: dict) -> str:
 
 def is_join_log(text: str) -> bool:
     lowered = text.lower()
-    return (
-        "username:" in lowered
-        and "user id:" in lowered
-        and ("new member joined" in lowered or "member joined!" in lowered)
+    has_user = "username:" in lowered and ("user id:" in lowered or "userid:" in lowered)
+    has_join = any(
+        phrase in lowered
+        for phrase in (
+            "new member joined",
+            "member joined!",
+            "member joined",
+            "new member join",
+            "user joined",
+        )
     )
+    return has_user and has_join
 
 
 def parse_join_log(full_text: str) -> dict | None:
@@ -161,9 +172,30 @@ class ScraperClient(discord.Client):
 
         try:
             self._target_channel = await self.fetch_channel(self.target_chat_id)
-            print(f"[{CLIENT_NAME}] Forwarding to: {self._target_channel}", flush=True)
+            print(
+                f"[{CLIENT_NAME}] Forwarding to: {self._target_channel} "
+                f"(id: {self._target_channel.id})",
+                flush=True,
+            )
+            if SEND_STARTUP_PING:
+                await self._send_startup_ping()
         except Exception as exc:
             print(f"[{CLIENT_NAME}] Could not open chat {self.target_chat_id}: {exc}", flush=True)
+
+    async def _send_startup_ping(self) -> None:
+        channel = self._target_channel
+        if channel is None:
+            return
+        ping = (
+            f"✅ **{CLIENT_NAME} scraper is online**\n"
+            f"Monitoring **{len(self.guilds)}** server(s). "
+            f"New member captures will appear here."
+        )
+        try:
+            await channel.send(ping)
+            print(f"[{CLIENT_NAME}] Startup message sent to group chat.", flush=True)
+        except Exception as exc:
+            print(f"[{CLIENT_NAME}] Startup message failed: {exc}", flush=True)
 
     async def on_message(self, message):
         parts = [message.content or ""]
@@ -194,13 +226,27 @@ class ScraperClient(discord.Client):
                 return
 
         try:
-            await channel.send(build_message(data))
+            msg = await channel.send(build_message(data))
             print(
-                f"[{CLIENT_NAME}] Forwarded capture for {data.get('username') or 'unknown'}.",
+                f"[{CLIENT_NAME}] Forwarded capture for {data.get('username') or 'unknown'} "
+                f"(message id: {msg.id}).",
                 flush=True,
             )
         except Exception as exc:
-            print(f"[{CLIENT_NAME}] Send failed: {exc}", flush=True)
+            print(
+                f"[{CLIENT_NAME}] Send failed for {data.get('username')}: {exc}",
+                flush=True,
+            )
+            try:
+                channel = await self.fetch_channel(self.target_chat_id)
+                self._target_channel = channel
+                msg = await channel.send(build_message(data))
+                print(
+                    f"[{CLIENT_NAME}] Retry send OK (message id: {msg.id}).",
+                    flush=True,
+                )
+            except Exception as retry_exc:
+                print(f"[{CLIENT_NAME}] Retry send failed: {retry_exc}", flush=True)
 
 
 async def main():
