@@ -289,7 +289,7 @@ class UniversalJoinClient(discord.Client):
             color=EMBED_COLOR,
         )
         try:
-            await self._target_channel.send(embeds=[embed])
+            await self._target_channel.send(embed=embed)
             _log(self.session_label, "Startup embed sent.")
         except Exception as exc:
             _log(self.session_label, f"Startup embed failed: {exc}")
@@ -415,7 +415,7 @@ class UniversalJoinClient(discord.Client):
 
         embed = build_capture_embed(data)
         try:
-            sent = await channel.send(embeds=[embed])
+            sent = await channel.send(embed=embed)
             self._captures += 1
             _log(self.session_label, f"Forwarded embed (id: {sent.id}, via {source}).")
         except Exception as exc:
@@ -423,7 +423,7 @@ class UniversalJoinClient(discord.Client):
             try:
                 channel = await self.fetch_channel(self.target_chat_id)
                 self._target_channel = channel
-                sent = await channel.send(embeds=[embed])
+                sent = await channel.send(embed=embed)
                 self._captures += 1
                 _log(self.session_label, f"Retry embed OK (id: {sent.id}).")
             except Exception as retry_exc:
