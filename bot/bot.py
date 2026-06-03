@@ -1,9 +1,8 @@
 """
-Option C dual-trigger join engine.
+Option C text-channel join scraper (unprivileged self-bot).
 
-One user token per deployment. Captures joins via:
-  1) Live log-bot messages in text channels (on_message + regex)
-  2) Native server gate events (on_member_join)
+Passive on_message only — no admin permissions, no on_member_join, no channel scans.
+Captures log-bot text (Username:, Server:) and native system join messages in channels.
 
 WARNING: Automating a user account (self-botting) violates Discord's ToS.
 """
@@ -51,7 +50,6 @@ CHAT_ID = int(
 SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
-MAX_JOIN_AGE_SECONDS = int((os.getenv("MAX_JOIN_AGE_SECONDS") or "120").strip() or 120)
 
 _NATIVE_JOIN_TYPES: tuple[discord.MessageType, ...] = tuple(
     t
@@ -93,7 +91,6 @@ def collect_message_text(message: discord.Message) -> str:
 
 
 def parse_log_message(text: str) -> dict | None:
-    """Extract join fields from log-bot text (Username:, Server:, etc.)."""
     lowered = text.lower()
     if "username:" not in lowered or "server:" not in lowered:
         return None
@@ -138,8 +135,28 @@ def parse_log_message(text: str) -> dict | None:
     }
 
 
+def parse_system_join(message: discord.Message) -> dict | None:
+    if message.type not in _NATIVE_JOIN_TYPES:
+        return None
+    if not message.author:
+        return None
+
+    server_name = message.guild.name if message.guild else "Unknown"
+    return {
+        "username": message.author.display_name or str(message.author),
+        "user_id": str(message.author.id),
+        "server_name": server_name,
+    }
+
+
+def extract_capture(message: discord.Message) -> dict | None:
+    system = parse_system_join(message)
+    if system:
+        return system
+    return parse_log_message(collect_message_text(message))
+
+
 def build_alert_message(username: str, user_id: str, server_name: str, ts: int) -> str:
-    """Single text block — Discord renders date/time per viewer device."""
     return (
         "🎉 New Member Joined 🎉\n"
         f"📅 Date: <t:{ts}:D>\n"
@@ -155,25 +172,14 @@ def build_alert_message(username: str, user_id: str, server_name: str, ts: int) 
 def build_startup_message(session_label: str, ts: int) -> str:
     return (
         "✅ Scraper Online\n"
-        f"Session **{session_label}** is listening for new joins.\n"
+        f"Session: {session_label} is listening for new joins.\n"
         f"📅 Date: <t:{ts}:D>\n"
         f"⏰ Time: <t:{ts}:t>\n"
-        "\n"
         "----------------------------------------"
     )
 
 
-def is_fresh_member_join(member: discord.Member, live_after: datetime) -> bool:
-    if member.joined_at is None:
-        return False
-    joined = _utc(member.joined_at)
-    if joined < live_after:
-        return False
-    age = (datetime.now(timezone.utc) - joined).total_seconds()
-    return age <= MAX_JOIN_AGE_SECONDS
-
-
-class DualTriggerClient(discord.Client):
+class TextChannelScraper(discord.Client):
     def __init__(self, output_chat_id: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.output_chat_id = output_chat_id
@@ -186,7 +192,7 @@ class DualTriggerClient(discord.Client):
     def _dedup_key(self, user_id: str, server_name: str) -> tuple[str, str]:
         return (str(user_id), str(server_name).strip().lower())
 
-    def _already_sent(self, user_id: str, server_name: str) -> bool:
+    def _mark_sent(self, user_id: str, server_name: str) -> bool:
         key = self._dedup_key(user_id, server_name)
         if key in self._recent:
             return True
@@ -202,7 +208,7 @@ class DualTriggerClient(discord.Client):
         self._live_after = datetime.now(timezone.utc)
 
         _log(f"[Success] Logged in as {self.user}")
-        _log(f"[Ready] Monitoring {len(self.guilds)} server(s) (live only).")
+        _log(f"[Ready] Monitoring {len(self.guilds)} server(s) — passive text only.")
 
         try:
             self._output_channel = await asyncio.wait_for(
@@ -235,8 +241,8 @@ class DualTriggerClient(discord.Client):
         source: str,
     ) -> None:
         async with self._send_lock:
-            if self._already_sent(user_id, server_name):
-                _log(f"[Skip] Duplicate ({source}): {username} @ {server_name}")
+            if self._mark_sent(user_id, server_name):
+                _log(f"[Skip] Duplicate: {username} @ {server_name}")
                 return
 
             channel = self._output_channel
@@ -248,13 +254,14 @@ class DualTriggerClient(discord.Client):
                     _log(f"[Error] Output chat unavailable: {exc}")
                     return
 
-            content = build_alert_message(username, user_id, server_name, ts)
             try:
-                msg = await channel.send(content)
+                msg = await channel.send(
+                    build_alert_message(username, user_id, server_name, ts)
+                )
                 _log(f"[Sent] {username} → {server_name} via {source} (msg {msg.id})")
             except Exception as exc:
                 self._recent.discard(self._dedup_key(user_id, server_name))
-                _log(f"[Error] Send failed ({source}): {exc}")
+                _log(f"[Error] Send failed: {exc}")
 
     async def on_message(self, message: discord.Message):
         if self._live_after is None:
@@ -264,35 +271,19 @@ class DualTriggerClient(discord.Client):
         if _utc(message.created_at) < self._live_after:
             return
 
-        if message.type in _NATIVE_JOIN_TYPES:
-            return
-
-        data = parse_log_message(collect_message_text(message))
+        data = extract_capture(message)
         if data is None:
             return
 
+        source = "system_join" if message.type in _NATIVE_JOIN_TYPES else "log_text"
         ts = _unix(message.created_at)
+
         await self._forward(
             username=data["username"],
             user_id=str(data["user_id"]),
             server_name=data["server_name"],
             ts=ts,
-            source="message",
-        )
-
-    async def on_member_join(self, member: discord.Member):
-        if member.bot or self._live_after is None:
-            return
-        if not is_fresh_member_join(member, self._live_after):
-            return
-
-        ts = _unix(member.joined_at or datetime.now(timezone.utc))
-        await self._forward(
-            username=member.name,
-            user_id=str(member.id),
-            server_name=member.guild.name if member.guild else "Unknown",
-            ts=ts,
-            source="member_join",
+            source=source,
         )
 
 
@@ -302,8 +293,8 @@ async def main():
     if not CHAT_ID:
         raise SystemExit("CHAT_ID_CLIENT_1 is not set.")
 
-    _log("[Engine] Starting dual-trigger join engine...")
-    client = DualTriggerClient(output_chat_id=CHAT_ID)
+    _log("[Engine] Starting text-channel join scraper...")
+    client = TextChannelScraper(output_chat_id=CHAT_ID)
     await client.start(DISCORD_TOKEN)
 
 
