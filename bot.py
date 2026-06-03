@@ -1,14 +1,15 @@
 """
 Discord self-bot that watches for third-party log-bot "New Member Joined!"
-text blocks, extracts the fields with regex, prints them to the terminal, and
-forwards them to a dedicated group chat.
+messages, extracts fields, and forwards them to the correct group chat.
 
-Multiple accounts run at once (asyncio.gather). Each account only forwards joins
-it sees in servers that account belongs to — join each brand's servers with the
-matching Discord account (Pikanto → Auto Wise, klentozz → Stevo, etc.).
+Multiple accounts run together. Any account may *see* a join log; the bot picks
+which group chat should receive it based on which account(s) are in that server.
+If several accounts share a server, Clients 2–4 take priority over Client 1 so
+Pikanto does not steal joins meant for Stevo / Emenite.
 
-WARNING: Automating a user account (self-botting) violates Discord's Terms of
-Service and may result in your account being banned. Use at your own risk.
+Optional override: MONITOR_SERVERS_CLIENT_N=Server A,Server B on Render.
+
+WARNING: Self-botting violates Discord ToS. Use at your own risk.
 """
 
 import asyncio
@@ -19,11 +20,9 @@ import sys
 import discord
 from dotenv import load_dotenv
 
-# Render (and other hosts) buffer stdout; flush each line so logs show live.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
-# Enable ANSI colors on Windows terminals (no-op if colorama isn't installed).
 try:
     import colorama
     colorama.just_fix_windows_console()
@@ -52,10 +51,6 @@ except Exception:
     pass
 
 
-# ---------------------------------------------------------------------------
-# TERMINAL STYLING
-# ---------------------------------------------------------------------------
-
 class C:
     RESET = "\033[0m"
     BOLD = "\033[1m"
@@ -68,15 +63,15 @@ class C:
     WHITE = "\033[97m"
 
 
-# ---------------------------------------------------------------------------
-# CONFIGURATION
-# ---------------------------------------------------------------------------
-
 load_dotenv()
 
 
+def load_monitor_servers(client_index: int) -> list[str]:
+    raw = (os.getenv(f"MONITOR_SERVERS_CLIENT_{client_index}") or "").strip()
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
 def load_accounts():
-    """Load every TOKEN_CLIENT_N / CHAT_ID_CLIENT_N pair from the environment."""
     accounts = []
     for i in range(1, 21):
         token = (os.getenv(f"TOKEN_CLIENT_{i}") or "").strip()
@@ -97,6 +92,7 @@ def load_accounts():
                 "name": (os.getenv(f"NAME_CLIENT_{i}") or f"Client {i}").strip(),
                 "token": token,
                 "chat_id": chat_id,
+                "monitor_servers": load_monitor_servers(i),
             }
         )
     return accounts
@@ -104,10 +100,6 @@ def load_accounts():
 
 ACCOUNTS = load_accounts()
 
-
-# ---------------------------------------------------------------------------
-# DATA HANDLER
-# ---------------------------------------------------------------------------
 
 FIELD_STYLE = [
     ("Date",          "date",        "📅", C.CYAN),
@@ -124,7 +116,6 @@ def process_extracted_data(data: dict, client_name: str = ""):
 
     title = "✨ NEW MEMBER CAPTURED ✨"
     title_cells = len(title) + 2
-
     label_width = max(len(label) for label, *_ in rows)
     inner_width = max(
         title_cells,
@@ -135,7 +126,6 @@ def process_extracted_data(data: dict, client_name: str = ""):
     sep = f"{C.GOLD}╠{'═' * (inner_width + 2)}╣{C.RESET}"
     bot = f"{C.GOLD}╚{'═' * (inner_width + 2)}╝{C.RESET}"
     bar = f"{C.GOLD}║{C.RESET}"
-
     title_pad = inner_width - title_cells
     left = title_pad // 2
     right = title_pad - left
@@ -196,45 +186,172 @@ def parse_join_log(full_text: str) -> dict | None:
     }
 
 
+def server_name_matches_guild(server_name: str, guild_name: str) -> bool:
+    a = server_name.lower().strip()
+    b = guild_name.lower().strip()
+    return a in b or b in a
+
+
 # ---------------------------------------------------------------------------
-# DISCORD CLIENT
+# SMART ROUTER
 # ---------------------------------------------------------------------------
+
+class CaptureRouter:
+    """Pick the right group chat for a capture based on server membership."""
+
+    def __init__(self):
+        self._clients: dict[int, "ScraperClient"] = {}
+        self._lock = asyncio.Lock()
+        self._delivered: dict[str, set[int]] = {}
+        self._pending: list[tuple["ScraperClient", dict]] = []
+
+    def register(self, client: "ScraperClient") -> None:
+        self._clients[client.client_index] = client
+        asyncio.create_task(self._flush_pending())
+
+    async def _flush_pending(self) -> None:
+        await asyncio.sleep(0.5)
+        pending = list(self._pending)
+        self._pending.clear()
+        for source, data in pending:
+            await self.dispatch(source, data)
+
+    def _explicit_owner(self, server_name: str) -> dict | None:
+        lowered = server_name.lower()
+        # Check Client 4 → 3 → 2 → 1 so Pikanto never wins a manual route.
+        for account in sorted(ACCOUNTS, key=lambda a: a["index"], reverse=True):
+            for pattern in account["monitor_servers"]:
+                if pattern.lower() in lowered:
+                    return account
+        return None
+
+    def _membership_owners(self, server_name: str) -> list[dict]:
+        owners = []
+        for account in ACCOUNTS:
+            client = self._clients.get(account["index"])
+            if client is None:
+                continue
+            for guild in client.guilds:
+                if server_name_matches_guild(server_name, guild.name):
+                    owners.append(account)
+                    break
+        return owners
+
+    def resolve_owner(self, server_name: str, source_index: int) -> dict | None:
+        if not server_name:
+            return next((a for a in ACCOUNTS if a["index"] == source_index), None)
+
+        explicit = self._explicit_owner(server_name)
+        if explicit:
+            return explicit
+
+        members = self._membership_owners(server_name)
+        if not members:
+            return next((a for a in ACCOUNTS if a["index"] == source_index), None)
+
+        if len(members) == 1:
+            return members[0]
+
+        # Shared server: prefer Client 4 > 3 > 2 > 1 so Pikanto does not take Stevo/Emenite joins.
+        return max(members, key=lambda a: a["index"])
+
+    async def dispatch(self, source: "ScraperClient", data: dict) -> None:
+        server = data.get("server_name") or ""
+        username = data.get("username") or "unknown"
+        dedup_key = f"{data.get('user_id')}:{server}:{username}"
+
+        owner_account = self.resolve_owner(server, source.client_index)
+        if owner_account is None:
+            print(f"[{source.name}] No owner for server {server!r}.", flush=True)
+            return
+
+        owner = self._clients.get(owner_account["index"])
+        chat_id = owner_account["chat_id"]
+        label = owner_account["name"]
+
+        if owner is None:
+            print(
+                f"[{label}] Waiting for {username} ({server}) — owner not online yet.",
+                flush=True,
+            )
+            self._pending.append((source, data))
+            return
+
+        async with self._lock:
+            if chat_id in self._delivered.get(dedup_key, set()):
+                return
+
+        try:
+            await owner.send_capture(data)
+        except Exception as exc:
+            print(f"[{label}] Failed to send to chat {chat_id}: {exc}", flush=True)
+            return
+
+        async with self._lock:
+            self._delivered.setdefault(dedup_key, set()).add(chat_id)
+            if len(self._delivered) > 500:
+                self._delivered.clear()
+
+        if source.client_index != owner.client_index:
+            print(
+                f"[{label}] Forwarded {username} ({server}) — routed from {source.name}.",
+                flush=True,
+            )
+        else:
+            print(f"[{label}] Forwarded capture for {username}.", flush=True)
+
+
+ROUTER = CaptureRouter()
+
 
 class ScraperClient(discord.Client):
-    """Forwards join captures only from servers this account belongs to."""
-
-    def __init__(self, name: str, target_chat_id: int, *args, **kwargs):
+    def __init__(
+        self,
+        name: str,
+        client_index: int,
+        target_chat_id: int,
+        monitor_servers: list[str],
+        *args,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.name = name
+        self.client_index = client_index
         self.target_chat_id = target_chat_id
+        self.monitor_servers = monitor_servers
         self._target_channel = None
+
+    async def send_capture(self, data: dict) -> None:
+        channel = self._target_channel
+        if channel is None:
+            channel = await self.fetch_channel(self.target_chat_id)
+            self._target_channel = channel
+        await channel.send(build_message(data))
 
     async def on_ready(self):
         print(f"[{self.name}] Logged in as {self.user} (id: {self.user.id})", flush=True)
-        print(
-            f"[{self.name}] Monitoring {len(self.guilds)} server(s) — "
-            f"new joins in any of these can be forwarded.",
-            flush=True,
-        )
+        print(f"[{self.name}] In {len(self.guilds)} server(s).", flush=True)
 
         guild_names = sorted(g.name for g in self.guilds)
-        preview = ", ".join(guild_names[:12])
-        if len(guild_names) > 12:
-            preview += f", ... (+{len(guild_names) - 12} more)"
+        preview = ", ".join(guild_names[:10])
+        if len(guild_names) > 10:
+            preview += f", ... (+{len(guild_names) - 10} more)"
         print(f"[{self.name}] Servers: {preview}", flush=True)
 
         if not self.target_chat_id:
-            print(f"[{self.name}] No target chat ID configured.", flush=True)
             return
 
         try:
             self._target_channel = await self.fetch_channel(self.target_chat_id)
-            print(f"[{self.name}] Forwarding to: {self._target_channel}", flush=True)
+            ROUTER.register(self)
+            print(f"[{self.name}] Group chat: {self._target_channel}", flush=True)
+            if self.monitor_servers:
+                print(
+                    f"[{self.name}] Manual routes: {', '.join(self.monitor_servers)}",
+                    flush=True,
+                )
         except Exception as exc:
-            print(
-                f"[{self.name}] Could not open target chat {self.target_chat_id}: {exc}",
-                flush=True,
-            )
+            print(f"[{self.name}] Could not open chat {self.target_chat_id}: {exc}", flush=True)
 
     async def on_message(self, message):
         parts = [message.content or ""]
@@ -254,43 +371,15 @@ class ScraperClient(discord.Client):
             return
 
         process_extracted_data(data, client_name=self.name)
+        await ROUTER.dispatch(self, data)
 
-        if not self.target_chat_id:
-            return
-
-        channel = self._target_channel
-        if channel is None:
-            try:
-                channel = await self.fetch_channel(self.target_chat_id)
-                self._target_channel = channel
-            except Exception as exc:
-                print(
-                    f"[{self.name}] Could not find target chat {self.target_chat_id}: {exc}",
-                    flush=True,
-                )
-                return
-
-        try:
-            await channel.send(build_message(data))
-            print(
-                f"[{self.name}] Forwarded capture for {data.get('username') or 'unknown'}.",
-                flush=True,
-            )
-        except Exception as exc:
-            print(
-                f"[{self.name}] Failed to send to chat {self.target_chat_id}: {exc}",
-                flush=True,
-            )
-
-
-# ---------------------------------------------------------------------------
-# RUNNER
-# ---------------------------------------------------------------------------
 
 async def run_client(account: dict):
     client = ScraperClient(
         name=account["name"],
+        client_index=account["index"],
         target_chat_id=account["chat_id"],
+        monitor_servers=account["monitor_servers"],
     )
     try:
         await client.start(account["token"])
@@ -299,30 +388,29 @@ async def run_client(account: dict):
 
 
 async def main():
-    print("Starting scraper (each account forwards only what it sees)...", flush=True)
+    print("Starting scraper (smart routing by server membership)...", flush=True)
 
     if not ACCOUNTS:
-        raise SystemExit(
-            "No accounts found. Add TOKEN_CLIENT_1 / CHAT_ID_CLIENT_1 "
-            "(and TOKEN_CLIENT_2 / CHAT_ID_CLIENT_2, etc.) to your environment."
-        )
+        raise SystemExit("No accounts found. Set TOKEN_CLIENT_1 / CHAT_ID_CLIENT_1, etc.")
 
     tasks = []
-    for account in ACCOUNTS:
+    # Start Clients 4→1 so Stevo/Emenite accounts are online before Pikanto captures.
+    for account in sorted(ACCOUNTS, key=lambda a: a["index"], reverse=True):
         if not account["chat_id"]:
             raise SystemExit(
-                f"[{account['name']}] TOKEN_CLIENT_{account['index']} is set but "
-                f"CHAT_ID_CLIENT_{account['index']} is missing. Add it in Render "
-                f"(Dashboard → your service → Environment), then redeploy."
+                f"CHAT_ID_CLIENT_{account['index']} missing for {account['name']}."
             )
-
         print(
-            f"[{account['name']}] Connecting (target chat {account['chat_id']})...",
+            f"[{account['name']}] Connecting → chat {account['chat_id']}...",
             flush=True,
         )
         tasks.append(asyncio.create_task(run_client(account)))
 
-    print(f"Launching {len(tasks)} account(s)...", flush=True)
+    print(
+        "Routing: shared servers go to highest client # (4>3>2>1). "
+        "Override with MONITOR_SERVERS_CLIENT_N on Render if needed.",
+        flush=True,
+    )
     await asyncio.gather(*tasks)
 
 
