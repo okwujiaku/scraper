@@ -57,7 +57,8 @@ DISCORD_TOKEN = (os.getenv("DISCORD_TOKEN") or os.getenv("TOKEN") or "").strip()
 CHAT_ID = int(
     (os.getenv("CHAT_ID_CLIENT_1") or os.getenv("CHAT_ID") or "0").strip() or 0
 )
-HISTORY_POLL_SECONDS = int((os.getenv("HISTORY_POLL_SECONDS") or "90").strip() or 90)
+HISTORY_POLL_SECONDS = int((os.getenv("HISTORY_POLL_SECONDS") or "45").strip() or 45)
+POLL_HISTORY_LIMIT = int((os.getenv("POLL_HISTORY_LIMIT") or "3").strip() or 3)
 SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
@@ -81,6 +82,12 @@ def _is_native_join(message: discord.Message) -> bool:
 
 def _log(label: str, message: str) -> None:
     print(f"[{label}] {message}", flush=True)
+
+
+def _utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _format_timestamp(dt: datetime | None) -> tuple[str, str]:
@@ -221,10 +228,9 @@ def extract_capture(message: discord.Message) -> tuple[dict | None, str]:
 
     custom = parse_custom_log(collect_message_text(message))
     if custom:
-        if not custom.get("date") or not custom.get("time"):
-            d, t = _format_timestamp(message.created_at)
-            custom.setdefault("date", d)
-            custom.setdefault("time", t)
+        d, t = _format_timestamp(message.created_at)
+        custom["date"] = d
+        custom["time"] = t
         if not custom.get("server_name") and message.guild:
             custom["server_name"] = message.guild.name
         return custom, "custom-log"
@@ -244,6 +250,7 @@ class UniversalJoinClient(discord.Client):
         self._session_label = "client"
         self._captures = 0
         self._messages_seen = 0
+        self._monitor_from: datetime | None = None
 
     @property
     def session_label(self) -> str:
@@ -252,8 +259,13 @@ class UniversalJoinClient(discord.Client):
         return self._session_label
 
     async def on_ready(self):
+        self._monitor_from = datetime.now(timezone.utc)
         self._session_label = str(self.user) if self.user else "client"
         _log(self.session_label, f"Logged in (id: {self.user.id})")
+        _log(
+            self.session_label,
+            f"Live capture window started at {_monitor_from.isoformat()} (only new joins after this).",
+        )
         _log(self.session_label, f"Monitoring {len(self.guilds)} server(s).")
 
         try:
@@ -337,32 +349,19 @@ class UniversalJoinClient(discord.Client):
         scanned = 0
         for channel in self._poll_channels:
             try:
-                async for message in channel.history(limit=10):
+                batch: list[discord.Message] = []
+                async for message in channel.history(limit=POLL_HISTORY_LIMIT):
+                    batch.append(message)
+                batch.sort(key=lambda m: m.created_at)
+                for message in batch:
                     await self._process_message(message, source="poll")
                 scanned += 1
                 await asyncio.sleep(0.15)
             except Exception:
                 pass
 
-        guilds = list(self.guilds)
-        if guilds:
-            start = (cycle * 6) % len(guilds)
-            for guild in guilds[start : start + 6]:
-                count = 0
-                for channel in await self._guild_text_channels(guild):
-                    try:
-                        async for message in channel.history(limit=5):
-                            await self._process_message(message, source="scan")
-                        scanned += 1
-                        count += 1
-                        await asyncio.sleep(0.12)
-                    except Exception:
-                        pass
-                    if count >= 10:
-                        break
-
         if cycle % 3 == 0:
-            _log(self.session_label, f"Poll cycle {cycle}: scanned {scanned} channel(s).")
+            _log(self.session_label, f"Poll cycle {cycle}: scanned {scanned} log channel(s).")
 
     async def _heartbeat_loop(self) -> None:
         await self.wait_until_ready()
@@ -376,16 +375,31 @@ class UniversalJoinClient(discord.Client):
     async def on_message(self, message: discord.Message):
         await self._process_message(message, source="live")
 
+    def _is_live_capture(self, message: discord.Message) -> bool:
+        if self._monitor_from is None:
+            return True
+        return _utc(message.created_at) >= self._monitor_from
+
+    def _remember_message(self, message: discord.Message) -> None:
+        self._seen_ids.add(message.id)
+        if len(self._seen_ids) > 10000:
+            drop = len(self._seen_ids) - 8000
+            for mid in list(self._seen_ids)[:drop]:
+                self._seen_ids.discard(mid)
+
     async def _process_message(self, message: discord.Message, source: str = "live") -> None:
         if message.id in self._seen_ids:
             return
-        self._seen_ids.add(message.id)
-        if len(self._seen_ids) > 8000:
-            self._seen_ids.clear()
 
         if message.author and self.user and message.author.id == self.user.id:
+            self._remember_message(message)
             return
 
+        if not self._is_live_capture(message):
+            self._remember_message(message)
+            return
+
+        self._remember_message(message)
         self._messages_seen += 1
         data, kind = extract_capture(message)
         if data is None:
