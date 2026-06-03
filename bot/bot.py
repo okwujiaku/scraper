@@ -1,8 +1,8 @@
 """
 Native join listener (Option C) — Smart Tech style.
 
-Listens for Discord's on_member_join event only (no channel reading or regex).
-Forwards a capture card to CHAT_ID_CLIENT_1 when someone joins any visible server.
+Listens for on_member_join only. Forwards realtime joins to CHAT_ID_CLIENT_1.
+Guild sync replays (old joined_at) are ignored.
 
 WARNING: Automating a user account (self-botting) violates Discord's ToS.
 """
@@ -12,10 +12,9 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
-from discord.http import handle_message_parameters
 from dotenv import load_dotenv
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -27,7 +26,6 @@ try:
 except Exception:
     pass
 
-# discord.py-self: pending_payments null crash on READY_SUPPLEMENTAL
 try:
     _orig = discord.state.ConnectionState.parse_ready_supplemental
 
@@ -51,39 +49,27 @@ CHAT_ID = int(
 SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
+# Only forward joins that happened within this many seconds (blocks guild-sync replays)
+MAX_JOIN_AGE_SECONDS = int((os.getenv("MAX_JOIN_AGE_SECONDS") or "120").strip() or 120)
 
-CARD_COLOR = 0x57F287
+_CARD_DIVIDER = "\n\u200b\n" + "─" * 30 + "\n"
 
 
 def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def format_join_time(when: datetime | None) -> tuple[str, str]:
-    """Use Discord's join timestamp (UTC), shown in the host's local timezone."""
     if when is None:
         when = datetime.now(timezone.utc)
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    local = when.astimezone()
+    local = _utc(when).astimezone()
     return local.strftime("%B %d, %Y"), local.strftime("%I:%M:%S %p").lstrip("0")
-
-
-def build_capture_embed(
-    username: str,
-    user_id: int,
-    server_name: str,
-    date_str: str,
-    time_str: str,
-) -> discord.Embed:
-    embed = discord.Embed(title="🎉 New Member Joined!", color=CARD_COLOR)
-    embed.add_field(name="📅 Date", value=date_str, inline=False)
-    embed.add_field(name="🕒 Time", value=time_str, inline=False)
-    embed.add_field(name="👤 Username", value=f"`{username}`", inline=False)
-    embed.add_field(name="🆔 User ID", value=str(user_id), inline=False)
-    embed.add_field(name="🏠 Server", value=server_name, inline=False)
-    embed.set_footer(text="Tap username to copy")
-    return embed
 
 
 def build_capture_message(
@@ -93,37 +79,46 @@ def build_capture_message(
     date_str: str,
     time_str: str,
 ) -> str:
-    """Markdown fallback — user tokens cannot send embeds via the API."""
+    """Smart Tech layout with spacing between fields and a divider after each card."""
     return (
         f"📅 **Date:** {date_str}\n"
+        f"\n"
         f"🕒 **Time:** {time_str}\n"
+        f"\n"
         f"👤 **Username:** `{username}`\n"
+        f"\n"
         f"🆔 **User ID:** {user_id}\n"
+        f"\n"
         f"🏠 **Server:** {server_name}\n"
+        f"\n"
         f"🎉 **New Member Joined!**"
+        f"{_CARD_DIVIDER}"
     )
 
 
-async def send_card(
-    channel: discord.abc.Messageable,
-    embed: discord.Embed,
-    *,
-    fallback_text: str | None = None,
-) -> discord.Message:
-    """
-    Dispatch via HTTP payload (embed serialized with .to_dict() internally).
-    Falls back to markdown if user-token embeds are rejected (API 50006).
-    """
-    target = await channel._get_channel()
-    state = channel._state
-    try:
-        with handle_message_parameters(embed=embed) as params:
-            data = await state.http.send_message(target.id, params=params)
-        return state.create_message(channel=target, data=data)
-    except Exception:
-        if fallback_text:
-            return await channel.send(fallback_text)
-        raise
+def build_startup_message(session_label: str) -> str:
+    date_str, time_str = format_join_time(datetime.now(timezone.utc))
+    return (
+        "✅ **Scraper online**\n"
+        f"\n"
+        f"Session **{session_label}** is listening for new joins.\n"
+        f"\n"
+        f"📅 **Date:** {date_str}\n"
+        f"\n"
+        f"🕒 **Time:** {time_str}"
+        f"{_CARD_DIVIDER}"
+    )
+
+
+def is_realtime_join(member: discord.Member, live_after: datetime) -> bool:
+    """True only for joins that just happened — not guild-sync replays from years ago."""
+    if member.joined_at is None:
+        return False
+    joined = _utc(member.joined_at)
+    if joined < live_after:
+        return False
+    age = (datetime.now(timezone.utc) - joined).total_seconds()
+    return age <= MAX_JOIN_AGE_SECONDS
 
 
 class NativeJoinClient(discord.Client):
@@ -132,13 +127,18 @@ class NativeJoinClient(discord.Client):
         self.output_chat_id = output_chat_id
         self._output_channel: discord.abc.Messageable | None = None
         self._ready_once = False
+        self._live_after: datetime | None = None
+        self._forwarded: set[tuple[int, int]] = set()
+        self._send_lock = asyncio.Lock()
 
     async def on_ready(self):
         if self._ready_once:
             return
         self._ready_once = True
+        self._live_after = datetime.now(timezone.utc)
 
         _log(f"[Success] Logged in as {self.user}")
+        _log(f"[Ready] Live capture from {self._live_after.isoformat()}")
 
         try:
             self._output_channel = await asyncio.wait_for(
@@ -151,24 +151,32 @@ class NativeJoinClient(discord.Client):
             return
 
         if SEND_STARTUP_PING:
-            date_str, time_str = format_join_time(datetime.now(timezone.utc))
-            ping = discord.Embed(
-                title="✅ Scraper online",
-                description=(
-                    f"Session **{self.user}** is listening for joins.\n"
-                    f"📅 {date_str} · 🕒 {time_str}"
-                ),
-                color=CARD_COLOR,
-            )
             try:
-                await send_card(self._output_channel, ping)
-                _log("[Ready] Startup card sent.")
+                async with self._send_lock:
+                    await self._output_channel.send(
+                        build_startup_message(str(self.user))
+                    )
+                _log("[Ready] Startup message sent.")
             except Exception as exc:
-                _log(f"[Error] Startup card failed: {exc}")
+                _log(f"[Error] Startup message failed: {exc}")
+
+        # Brief pause so guild-sync member_join bursts finish before we accept joins
+        await asyncio.sleep(15)
+        self._live_after = datetime.now(timezone.utc)
+        _log("[Ready] Now accepting realtime joins only.")
 
     async def on_member_join(self, member: discord.Member):
-        if member.bot:
+        if member.bot or self._live_after is None:
             return
+
+        if not is_realtime_join(member, self._live_after):
+            return
+
+        guild_id = member.guild.id if member.guild else 0
+        key = (member.id, guild_id)
+        if key in self._forwarded:
+            return
+        self._forwarded.add(key)
 
         date_str, time_str = format_join_time(member.joined_at)
         username = member.name
@@ -186,12 +194,12 @@ class NativeJoinClient(discord.Client):
                 _log(f"[Error] Output chat unavailable: {exc}")
                 return
 
-        embed = build_capture_embed(username, user_id, server_name, date_str, time_str)
-        fallback = build_capture_message(
+        content = build_capture_message(
             username, user_id, server_name, date_str, time_str
         )
         try:
-            msg = await send_card(channel, embed, fallback_text=fallback)
+            async with self._send_lock:
+                msg = await channel.send(content)
             _log(f"[Sent] Capture forwarded (msg {msg.id}).")
         except Exception as exc:
             _log(f"[Error] Forward failed: {exc}")
