@@ -1,50 +1,49 @@
-# Discord Join Scraper — multi-account (one Render worker)
+# Discord Join Scraper (Option C — one worker per brand)
 
-One Background Worker runs **all brand accounts** together. Each account watches Discord;
-a **router** sends join alerts to the correct group chat (Pikanto / Stevo / Emenite).
+One simple bot, **four Render Background Workers** (Pikanto, Stevo, Emenite 1, Emenite 2). Each worker runs **one Discord account** and forwards to **one group chat**.
 
-## What you need on Render (one service)
+## What went wrong before (lessons from the working logs)
 
-Set **all** of these in Environment (Render does **not** use your local `.env`):
+The old **multi-account** setup worked because one process + a router sent joins to the right group. When we split to Option C, these were the real bugs — not “Option C is bad”:
 
-```
-TOKEN_CLIENT_1=...     CHAT_ID_CLIENT_1=...   # Pikanto → Auto Wise
-TOKEN_CLIENT_2=...     CHAT_ID_CLIENT_2=...   # klentozz → Stevo Auto Wise
-TOKEN_CLIENT_3=...     CHAT_ID_CLIENT_3=...   # Emenite 1
-TOKEN_CLIENT_4=...     CHAT_ID_CLIENT_4=...   # Emenite 2
-PYTHON_VERSION=3.11.9
-```
+1. **`CHAT_ID` missing on Render** — bot captured joins in logs but never sent to Discord (`No target chat ID configured`).
+2. **`pending_payments: null` crash** — fixed with a startup library patch (kept in `bot/bot.py`).
+3. **Parser / message drift** — extra layers (poll loops, `_live_after`, new card layout) replaced the simple `on_message` + **NEW MEMBER CAPTURED** flow that worked.
+4. **Embed log bots** — fields must flatten as `Username: value` or `username:` never appears in text.
 
-Optional per-brand server routing:
+Option C is restored to the **simple working model** per worker, with only those fixes kept.
 
-```
-MONITOR_SERVERS_CLIENT_1=Invest With Charan
-MONITOR_SERVERS_CLIENT_2=Chill Trading,Profit Insider,Connor
-```
+## Render — one worker per brand
 
+| Service | Account | Env on **that** worker |
+|---------|---------|-------------------------|
+| scraper-pikanto | pikanto200 | `DISCORD_TOKEN` or `TOKEN_CLIENT_1`, `CHAT_ID` or `CHAT_ID_CLIENT_1` |
+| scraper-stevo | klentozz | `DISCORD_TOKEN`, `CHAT_ID_CLIENT_1` = Stevo group id (or `CLIENT_INDEX=2` + `_CLIENT_2`) |
+| scraper-emenite1 | rp.profits_2 | token + chat for Emenite 1 |
+| scraper-emenite2 | lost1millionn | token + chat for Emenite 2 |
+
+Each service:
+
+- **Root Directory:** `bot` (recommended) or repo root (`bot.py` launcher)
 - **Build:** `pip install -r requirements.txt`
 - **Start:** `python bot.py`
-- **Root directory:** repo root (not `bot/`)
+- **Env:** token + chat id + `CLIENT_NAME` + `PYTHON_VERSION=3.11.9`
 
-## How it works
+**Important:** Render never reads your local `.env`. Every variable must be in the Render dashboard for **each** worker.
 
-1. Log bots post `New Member Joined!` with `Username:`, `User ID:`, `Server:` (or `Target Server:`).
-2. Any connected account that **sees** that message triggers a capture.
-3. The **router** picks which group gets the alert (Clients 4→3→2→1 beat Client 1 on shared servers).
-4. Discord message format: **NEW MEMBER CAPTURED** card (date/time from the log bot text).
+## How each worker behaves
 
-## Repo layout
-
-```
-bot.py              ← main app (multi-account) — deploy this
-requirements.txt
-bot/                ← optional single-account copy (not used by default start command)
-```
+1. Logs in as **one** user account.
+2. Listens with **`on_message`** for log-bot posts containing `Username:`, `User ID:`, and `New Member Joined!`.
+3. Parses Date, Time, Username, User ID, Server (or Target Server) from the message.
+4. Sends the **NEW MEMBER CAPTURED** markdown card to **that worker’s** group chat only.
+5. That account must be **in the servers** where join logs appear — no cross-brand router.
 
 ## Local run
 
 ```bash
-cp bot/.env.example .env   # or use your root .env with TOKEN_CLIENT_1..4
+cd bot
+cp .env.example .env
 pip install -r requirements.txt
 python bot.py
 ```

@@ -1,12 +1,11 @@
-# Set these in Render → your Background Worker → Environment
+# Set on each Render Background Worker (one brand per worker)
 
-CLIENT_INDEX=1
-TOKEN=
+DISCORD_TOKEN=
 CHAT_ID=
-# Or use numbered vars (set CLIENT_INDEX to match):
+CLIENT_NAME=Brand Name
+PYTHON_VERSION=3.11.9
+
+# Stevo example (same worker, different numbering):
+# CLIENT_INDEX=2
 # TOKEN_CLIENT_2=
 # CHAT_ID_CLIENT_2=
-
-CLIENT_NAME=Customer Name
-PYTHON_VERSION=3.11.9
-# DEBUG_JOIN_LOGS=true
