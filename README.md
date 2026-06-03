@@ -27,7 +27,9 @@ python bot.py
 
 ## Render — your 4 brands (create 4 Background Workers)
 
-Create **four separate** Background Workers, all pointing at this repo with **Root Directory = `bot`**.
+**If build fails with `No such file or directory: requirements.txt`:** set **Root Directory** to `bot`, or redeploy after pulling latest `main` (repo root includes a launcher).
+
+Create **four separate** Background Workers, all pointing at this repo.
 
 | Service name       | CLIENT_NAME   | TOKEN / CHAT_ID        |
 |--------------------|---------------|-------------------------|
@@ -38,7 +40,7 @@ Create **four separate** Background Workers, all pointing at this repo with **Ro
 
 Each service:
 
-- **Root Directory:** `bot`
+- **Root Directory:** `bot` (recommended) — or leave blank and use repo-root `bot.py` + `requirements.txt`
 - **Build Command:** `pip install -r requirements.txt`
 - **Start Command:** `python bot.py`
 - **Environment:** `TOKEN`, `CHAT_ID`, `CLIENT_NAME`, `PYTHON_VERSION=3.11.9`
