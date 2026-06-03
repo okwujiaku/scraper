@@ -12,8 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
 
 import discord
 from discord.http import handle_message_parameters
@@ -53,7 +52,6 @@ SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() i
     "1", "true", "yes", "on",
 )
 
-WAT = ZoneInfo("Africa/Lagos")
 CARD_COLOR = 0x57F287
 
 
@@ -61,9 +59,14 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def wat_now() -> tuple[str, str]:
-    now = datetime.now(WAT)
-    return now.strftime("%B %d, %Y"), now.strftime("%I:%M:%S %p").lstrip("0")
+def format_join_time(when: datetime | None) -> tuple[str, str]:
+    """Use Discord's join timestamp (UTC), shown in the host's local timezone."""
+    if when is None:
+        when = datetime.now(timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    local = when.astimezone()
+    return local.strftime("%B %d, %Y"), local.strftime("%I:%M:%S %p").lstrip("0")
 
 
 def build_capture_embed(
@@ -148,12 +151,12 @@ class NativeJoinClient(discord.Client):
             return
 
         if SEND_STARTUP_PING:
-            date_str, time_str = wat_now()
+            date_str, time_str = format_join_time(datetime.now(timezone.utc))
             ping = discord.Embed(
                 title="✅ Scraper online",
                 description=(
                     f"Session **{self.user}** is listening for joins.\n"
-                    f"📅 {date_str} · 🕒 {time_str} (WAT)"
+                    f"📅 {date_str} · 🕒 {time_str}"
                 ),
                 color=CARD_COLOR,
             )
@@ -167,14 +170,12 @@ class NativeJoinClient(discord.Client):
         if member.bot:
             return
 
-        date_str, time_str = wat_now()
+        date_str, time_str = format_join_time(member.joined_at)
         username = member.name
         user_id = member.id
         server_name = member.guild.name if member.guild else "Unknown"
 
-        _log(
-            f"[Join] {username} ({user_id}) → {server_name} @ {time_str} WAT"
-        )
+        _log(f"[Join] {username} ({user_id}) → {server_name} @ {date_str} {time_str}")
 
         channel = self._output_channel
         if channel is None:
