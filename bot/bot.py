@@ -67,7 +67,10 @@ SEND_STARTUP_PING = (os.getenv("SEND_STARTUP_PING") or "true").strip().lower() i
 HISTORY_POLL_SECONDS = int((os.getenv("HISTORY_POLL_SECONDS") or "90").strip() or 90)
 LOG_CHANNEL_KEYWORDS = tuple(
     k.strip().lower()
-    for k in (os.getenv("LOG_CHANNEL_KEYWORDS") or "log,join,welcome,audit,members").split(",")
+    for k in (
+        os.getenv("LOG_CHANNEL_KEYWORDS")
+        or "log,join,welcome,audit,member,members,new,arrival,bot,notify,record,staff,mod"
+    ).split(",")
     if k.strip()
 )
 
@@ -242,6 +245,8 @@ class ScraperClient(discord.Client):
         self._seen_message_ids: set[int] = set()
         self._poll_channels: list[discord.TextChannel] = []
         self._messages_seen = 0
+        self._captures_sent = 0
+        self._poll_cycle = 0
 
     async def on_ready(self):
         print(f"[{CLIENT_NAME}] Logged in as {self.user} (id: {self.user.id})", flush=True)
@@ -264,14 +269,22 @@ class ScraperClient(discord.Client):
         except Exception as exc:
             print(f"[{CLIENT_NAME}] Could not open chat {self.target_chat_id}: {exc}", flush=True)
 
-        await self._warm_channels()
-        self._poll_channels = self._discover_log_channels()
+        # Guild channel lists are often empty for a few seconds right after READY.
+        await asyncio.sleep(5)
+        self._poll_channels = await self._discover_log_channels()
+        warmed, warm_failed = await self._warm_channels(self._poll_channels)
         print(
-            f"[{CLIENT_NAME}] Watching {len(self._poll_channels)} log-like channel(s); "
-            f"history poll every {HISTORY_POLL_SECONDS}s.",
+            f"[{CLIENT_NAME}] Log channels: {len(self._poll_channels)} matched, "
+            f"{warmed} warmed, {warm_failed} no access.",
+            flush=True,
+        )
+        print(
+            f"[{CLIENT_NAME}] History poll every {HISTORY_POLL_SECONDS}s "
+            f"(log channels + all readable channels).",
             flush=True,
         )
         self.loop.create_task(self._history_poll_loop())
+        self.loop.create_task(self._heartbeat_loop())
 
     async def _send_startup_ping(self) -> None:
         channel = self._target_channel
@@ -288,33 +301,51 @@ class ScraperClient(discord.Client):
         except Exception as exc:
             print(f"[{CLIENT_NAME}] Startup message failed: {exc}", flush=True)
 
-    def _discover_log_channels(self) -> list[discord.TextChannel]:
+    async def _guild_text_channels(self, guild: discord.Guild) -> list[discord.TextChannel]:
         channels: list[discord.TextChannel] = []
-        for guild in self.guilds:
-            for channel in guild.text_channels:
-                name = (channel.name or "").lower()
-                if any(keyword in name for keyword in LOG_CHANNEL_KEYWORDS):
+        try:
+            async for channel in guild.fetch_channels():
+                if isinstance(channel, discord.TextChannel):
                     channels.append(channel)
-        return channels[:200]
+        except Exception:
+            channels = list(guild.text_channels)
+        return channels
 
-    async def _warm_channels(self) -> None:
-        """Open channels briefly so Discord delivers live MESSAGE_CREATE events."""
-        warmed = 0
+    async def _iter_text_channels(self):
         for guild in self.guilds:
-            for channel in guild.text_channels:
-                name = (channel.name or "").lower()
-                if not any(keyword in name for keyword in LOG_CHANNEL_KEYWORDS):
-                    continue
-                try:
-                    await channel.history(limit=1).flatten()
-                    warmed += 1
-                    await asyncio.sleep(0.35)
-                except Exception:
-                    pass
-                if warmed >= 80:
-                    print(f"[{CLIENT_NAME}] Warmed {warmed} log channel(s).", flush=True)
-                    return
-        print(f"[{CLIENT_NAME}] Warmed {warmed} log channel(s).", flush=True)
+            for channel in await self._guild_text_channels(guild):
+                yield channel
+
+    async def _discover_log_channels(self) -> list[discord.TextChannel]:
+        channels: list[discord.TextChannel] = []
+        async for channel in self._iter_text_channels():
+            name = (channel.name or "").lower()
+            if any(keyword in name for keyword in LOG_CHANNEL_KEYWORDS):
+                channels.append(channel)
+        return channels[:300]
+
+    async def _warm_channels(self, channels: list[discord.TextChannel]) -> tuple[int, int]:
+        """Open channels so Discord delivers live MESSAGE_CREATE events."""
+        warmed = 0
+        failed = 0
+        for channel in channels[:120]:
+            try:
+                await channel.history(limit=1).flatten()
+                warmed += 1
+                await asyncio.sleep(0.25)
+            except Exception:
+                failed += 1
+        return warmed, failed
+
+    async def _heartbeat_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(300)
+            print(
+                f"[{CLIENT_NAME}] Heartbeat: {self._messages_seen} messages seen, "
+                f"{self._captures_sent} captures sent.",
+                flush=True,
+            )
 
     async def _history_poll_loop(self) -> None:
         await self.wait_until_ready()
@@ -326,15 +357,46 @@ class ScraperClient(discord.Client):
             await asyncio.sleep(HISTORY_POLL_SECONDS)
 
     async def _poll_log_channels(self) -> None:
+        self._poll_cycle += 1
         if not self._poll_channels:
-            self._poll_channels = self._discover_log_channels()
+            self._poll_channels = await self._discover_log_channels()
+
+        polled_ok = 0
         for channel in self._poll_channels:
             try:
-                async for message in channel.history(limit=8):
+                async for message in channel.history(limit=10):
                     await self._handle_message(message, source="poll")
-                    await asyncio.sleep(0.15)
+                polled_ok += 1
+                await asyncio.sleep(0.2)
             except Exception:
                 pass
+
+        # Also scan readable channels in a rotating slice of guilds (join logs may
+        # be in channels without "log" in the name).
+        guilds = list(self.guilds)
+        if guilds:
+            start = (self._poll_cycle * 5) % len(guilds)
+            batch = guilds[start : start + 8]
+            for guild in batch:
+                count = 0
+                for channel in await self._guild_text_channels(guild):
+                    try:
+                        async for message in channel.history(limit=5):
+                            await self._handle_message(message, source="scan")
+                        polled_ok += 1
+                        count += 1
+                        await asyncio.sleep(0.15)
+                    except Exception:
+                        pass
+                    if count >= 12:
+                        break
+
+        if self._poll_cycle % 3 == 0:
+            print(
+                f"[{CLIENT_NAME}] Poll cycle {self._poll_cycle}: "
+                f"{polled_ok} channel(s) scanned.",
+                flush=True,
+            )
 
     async def _handle_message(self, message: discord.Message, source: str = "live") -> None:
         if message.id in self._seen_message_ids:
@@ -367,6 +429,7 @@ class ScraperClient(discord.Client):
 
         try:
             msg = await channel.send(build_message(data))
+            self._captures_sent += 1
             print(
                 f"[{CLIENT_NAME}] Forwarded {data.get('username') or 'unknown'} "
                 f"(msg {msg.id}, via {source}).",
@@ -378,6 +441,7 @@ class ScraperClient(discord.Client):
                 channel = await self.fetch_channel(self.target_chat_id)
                 self._target_channel = channel
                 msg = await channel.send(build_message(data))
+                self._captures_sent += 1
                 print(f"[{CLIENT_NAME}] Retry send OK (msg {msg.id}).", flush=True)
             except Exception as retry_exc:
                 print(f"[{CLIENT_NAME}] Retry send failed: {retry_exc}", flush=True)
