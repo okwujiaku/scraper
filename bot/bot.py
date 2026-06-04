@@ -88,6 +88,19 @@ def _load_credentials(index: int) -> tuple[str, int, str]:
 
 CLIENT_INDEX = _client_index()
 TOKEN, CHAT_ID, CLIENT_NAME = _load_credentials(CLIENT_INDEX)
+DEBUG_JOIN_LOGS = (os.getenv("DEBUG_JOIN_LOGS") or "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+_JOIN_PHRASES = (
+    "new member joined",
+    "member joined!",
+    "member joined",
+    "member join",
+    "user joined",
+    "has joined",
+    "joined the server",
+)
 
 FIELD_STYLE = [
     ("Date", "date", "📅", C.CYAN),
@@ -167,35 +180,110 @@ def collect_message_text(message: discord.Message) -> str:
     return "\n".join(parts)
 
 
-def is_join_log(text: str) -> bool:
+def _has_join_phrase(text: str) -> bool:
     lowered = text.lower()
-    return (
-        "username:" in lowered
-        and "user id:" in lowered
-        and ("new member joined" in lowered or "member joined!" in lowered)
+    if any(p in lowered for p in _JOIN_PHRASES):
+        return True
+    return "join" in lowered and "member" in lowered
+
+
+def _has_user_markers(text: str) -> bool:
+    lowered = text.lower()
+    if "username:" in lowered or "user:" in lowered:
+        return True
+    return bool(re.search(r"username\s*[:：]", text, re.IGNORECASE))
+
+
+def _has_id_markers(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        m in lowered
+        for m in ("user id:", "userid:", "discord id:", "member id:")
     )
+
+
+def is_join_log(text: str) -> bool:
+    """Gate: join phrase + username marker + user-id marker (Pikanto log-bot shape)."""
+    return _has_join_phrase(text) and _has_user_markers(text) and _has_id_markers(text)
+
+
+def _clean_field(match) -> str | None:
+    if not match:
+        return None
+    return match.group(1).strip().replace("**", "").replace("`", "").strip()
+
+
+def _parse_from_field_map(field_map: dict[str, str], full_text: str) -> dict | None:
+    username = field_map.get("username") or _clean_field(
+        re.search(r"(?:Username|User)\s*[:：]\s*(.+)", full_text, re.IGNORECASE)
+    )
+    user_id = (
+        field_map.get("user_id")
+        or _clean_field(re.search(r"User\s*ID\s*[:：]\s*(.+)", full_text, re.IGNORECASE))
+        or _clean_field(re.search(r"Discord\s*ID\s*[:：]\s*(.+)", full_text, re.IGNORECASE))
+        or _clean_field(re.search(r"Member\s*ID\s*[:：]\s*(.+)", full_text, re.IGNORECASE))
+    )
+    server_name = (
+        field_map.get("server_name")
+        or _clean_field(re.search(r"Target\s+Server\s*[:：]\s*(.+)", full_text, re.IGNORECASE))
+        or _clean_field(re.search(r"Server\s*Name\s*[:：]\s*(.+)", full_text, re.IGNORECASE))
+        or _clean_field(re.search(r"Server\s*[:：]\s*(.+)", full_text, re.IGNORECASE))
+        or _clean_field(re.search(r"Guild\s*[:：]\s*(.+)", full_text, re.IGNORECASE))
+    )
+    if not username:
+        return None
+    return {
+        "date": _clean_field(re.search(r"Date\s*[:：]\s*(.+)", full_text, re.IGNORECASE)),
+        "time": _clean_field(re.search(r"Time\s*[:：]\s*(.+)", full_text, re.IGNORECASE)),
+        "username": username,
+        "server_name": server_name or "Unknown",
+        "user_id": user_id or "N/A",
+    }
+
+
+def _embed_field_map(message: discord.Message) -> dict[str, str]:
+    aliases = {
+        "username": "username",
+        "user": "username",
+        "user id": "user_id",
+        "userid": "user_id",
+        "discord id": "user_id",
+        "member id": "user_id",
+        "server": "server_name",
+        "target server": "server_name",
+        "server name": "server_name",
+        "guild": "server_name",
+        "guild name": "server_name",
+    }
+    found: dict[str, str] = {}
+    for embed in message.embeds:
+        for field in embed.fields:
+            key = re.sub(r"[^a-z0-9]+", " ", (field.name or "").lower()).strip()
+            canon = aliases.get(key, key)
+            value = (field.value or "").strip().replace("**", "").replace("`", "")
+            if canon and value:
+                found[canon] = value
+    return found
+
+
+def parse_join_log_message(message: discord.Message) -> dict | None:
+    text = collect_message_text(message)
+    field_map = _embed_field_map(message)
+
+    if message.embeds and field_map.get("username") and _has_join_phrase(text):
+        data = _parse_from_field_map(field_map, text)
+        if data:
+            return data
+
+    if not is_join_log(text):
+        return None
+    return _parse_from_field_map({}, text)
 
 
 def parse_join_log(full_text: str) -> dict | None:
     if not is_join_log(full_text):
         return None
-
-    def clean(match):
-        if not match:
-            return None
-        return match.group(1).strip().replace("**", "").replace("`", "").strip()
-
-    server = clean(
-        re.search(r"Target\s+Server:\s*(.+)", full_text, re.IGNORECASE)
-    ) or clean(re.search(r"Server:\s*(.+)", full_text, re.IGNORECASE))
-
-    return {
-        "date": clean(re.search(r"Date:\s*(.+)", full_text, re.IGNORECASE)),
-        "time": clean(re.search(r"Time:\s*(.+)", full_text, re.IGNORECASE)),
-        "username": clean(re.search(r"Username:\s*(.+)", full_text, re.IGNORECASE)),
-        "server_name": server,
-        "user_id": clean(re.search(r"User ID:\s*(.+)", full_text, re.IGNORECASE)),
-    }
+    return _parse_from_field_map({}, full_text)
 
 
 class ScraperClient(discord.Client):
@@ -238,8 +326,21 @@ class ScraperClient(discord.Client):
             )
 
     async def on_message(self, message):
-        data = parse_join_log(collect_message_text(message))
+        if message.author and self.user and message.author.id == self.user.id:
+            return
+
+        data = parse_join_log_message(message)
         if data is None:
+            if DEBUG_JOIN_LOGS:
+                text = collect_message_text(message)
+                low = text.lower()
+                if "join" in low or "username" in low or "member" in low:
+                    preview = (text[:160] + "...") if len(text) > 160 else text
+                    ch = getattr(message.channel, "name", message.channel)
+                    print(
+                        f"[{CLIENT_NAME}] [Debug] skipped in #{ch}: {preview!r}",
+                        flush=True,
+                    )
             return
 
         process_extracted_data(data)
