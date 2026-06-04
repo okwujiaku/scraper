@@ -167,198 +167,35 @@ def collect_message_text(message: discord.Message) -> str:
     return "\n".join(parts)
 
 
-_JOIN_PHRASES = (
-    "new member joined",
-    "member joined!",
-    "member joined",
-    "member join",
-    "user joined",
-    "has joined",
-    "joined the server",
-    "welcome to the server",
-)
-
-_FIELD_LINE_LABELS = frozenset({
-    "username", "user", "member", "user id", "userid", "discord id",
-    "member id", "server", "target server", "server name", "guild",
-    "date", "time",
-})
-
-
-def _normalize_field_lines(text: str) -> str:
-    """Username\\nvalue pairs (embed flatten bug) -> Username: value."""
-    lines = text.splitlines()
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        raw = lines[i].strip().replace("**", "").replace("`", "")
-        key = raw.rstrip(":").lower()
-        if key in _FIELD_LINE_LABELS and i + 1 < len(lines):
-            nxt = lines[i + 1].strip()
-            nxt_key = nxt.rstrip(":").lower()
-            if nxt and nxt_key not in _FIELD_LINE_LABELS:
-                label = raw.rstrip(":")
-                out.append(f"{label}: {nxt}")
-                i += 2
-                continue
-        out.append(lines[i])
-        i += 1
-    return "\n".join(out)
-
-
-def _has_join_phrase(text: str) -> bool:
-    lowered = text.lower()
-    if any(p in lowered for p in _JOIN_PHRASES):
-        return True
-    if re.search(r"joined\s*<t:\d+", lowered):
-        return True
-    if "welcome" in lowered and "server" in lowered:
-        return True
-    return "join" in lowered and "member" in lowered
-
-
-def _has_user_markers(text: str) -> bool:
-    lowered = text.lower()
-    if "username:" in lowered or "user:" in lowered:
-        return True
-    if re.search(r"member\s*[:：]\s*(?!<?@)", text, re.IGNORECASE):
-        return True
-    return bool(re.search(r"username\s*[:：]", text, re.IGNORECASE))
-
-
-def _has_id_markers(text: str) -> bool:
-    lowered = text.lower()
-    if any(m in lowered for m in ("user id:", "userid:", "discord id:", "member id:")):
-        return True
-    if re.search(r"member\s*[:：]\s*<?@!?\d{17,20}>?", text, re.IGNORECASE):
-        return True
-    return bool(re.search(r"<?@!?\d{17,20}>?", text))
-
-
 def is_join_log(text: str) -> bool:
-    normalized = _normalize_field_lines(text)
+    lowered = text.lower()
     return (
-        _has_join_phrase(normalized)
-        and _has_user_markers(normalized)
-        and _has_id_markers(normalized)
+        "username:" in lowered
+        and "user id:" in lowered
+        and ("new member joined" in lowered or "member joined!" in lowered)
     )
-
-
-def _clean_field(match) -> str | None:
-    if not match:
-        return None
-    return match.group(1).strip().replace("**", "").replace("`", "").strip()
-
-
-def _snowflake_from(value: str) -> str | None:
-    m = re.search(r"(\d{17,20})", value or "")
-    return m.group(1) if m else None
-
-
-def _embed_field_map(message: discord.Message) -> dict[str, str]:
-    aliases = {
-        "username": "username",
-        "user": "username",
-        "member": "username",
-        "user id": "user_id",
-        "userid": "user_id",
-        "discord id": "user_id",
-        "member id": "user_id",
-        "server": "server_name",
-        "target server": "server_name",
-        "server name": "server_name",
-        "guild": "server_name",
-        "guild name": "server_name",
-    }
-    found: dict[str, str] = {}
-    for embed in message.embeds:
-        for field in embed.fields:
-            key = re.sub(r"[^a-z0-9]+", " ", (field.name or "").lower()).strip()
-            canon = aliases.get(key, key)
-            value = (field.value or "").strip().replace("**", "").replace("`", "")
-            if canon == "username" and _snowflake_from(value) and not found.get("user_id"):
-                found["user_id"] = _snowflake_from(value) or value
-                continue
-            if canon and value:
-                found[canon] = value
-    return found
-
-
-def _parse_from_field_map(field_map: dict[str, str], full_text: str) -> dict | None:
-    text = _normalize_field_lines(full_text)
-
-    username = field_map.get("username")
-    if username and _snowflake_from(username) and not field_map.get("user_id"):
-        field_map = dict(field_map)
-        field_map["user_id"] = _snowflake_from(username)
-        username = None
-
-    if not username:
-        for pattern in (
-            r"Username\s*[:：]\s*(.+)",
-            r"User\s*[:：]\s*(.+)",
-            r"Member\s*[:：]\s*(.+)",
-        ):
-            candidate = _clean_field(re.search(pattern, text, re.IGNORECASE))
-            if candidate and not _snowflake_from(candidate):
-                username = candidate
-                break
-
-    user_id = field_map.get("user_id")
-    if not user_id:
-        for pattern in (
-            r"User\s*ID\s*[:：]\s*(.+)",
-            r"Userid\s*[:：]\s*(.+)",
-            r"Discord\s*ID\s*[:：]\s*(.+)",
-            r"Member\s*ID\s*[:：]\s*(.+)",
-            r"Member\s*[:：]\s*(.+)",
-        ):
-            candidate = _clean_field(re.search(pattern, text, re.IGNORECASE))
-            if candidate:
-                user_id = _snowflake_from(candidate) or candidate
-                break
-    if not user_id:
-        user_id = _snowflake_from(text)
-
-    server_name = (
-        field_map.get("server_name")
-        or _clean_field(re.search(r"Target\s+Server\s*[:：]\s*(.+)", text, re.IGNORECASE))
-        or _clean_field(re.search(r"Server\s*Name\s*[:：]\s*(.+)", text, re.IGNORECASE))
-        or _clean_field(re.search(r"Server\s*[:：]\s*(.+)", text, re.IGNORECASE))
-        or _clean_field(re.search(r"Guild\s*[:：]\s*(.+)", text, re.IGNORECASE))
-    )
-
-    if not username:
-        return None
-
-    return {
-        "date": _clean_field(re.search(r"Date\s*[:：]\s*(.+)", text, re.IGNORECASE)),
-        "time": _clean_field(re.search(r"Time\s*[:：]\s*(.+)", text, re.IGNORECASE)),
-        "username": username,
-        "server_name": server_name or "Unknown",
-        "user_id": user_id or "N/A",
-    }
-
-
-def parse_join_log_message(message: discord.Message) -> dict | None:
-    text = _normalize_field_lines(collect_message_text(message))
-    field_map = _embed_field_map(message)
-
-    if message.embeds and field_map.get("username") and _has_join_phrase(text):
-        data = _parse_from_field_map(field_map, text)
-        if data:
-            return data
-
-    if not is_join_log(text):
-        return None
-    return _parse_from_field_map(field_map, text)
 
 
 def parse_join_log(full_text: str) -> dict | None:
-    text = _normalize_field_lines(full_text)
-    if not is_join_log(text):
+    if not is_join_log(full_text):
         return None
-    return _parse_from_field_map({}, text)
+
+    def clean(match):
+        if not match:
+            return None
+        return match.group(1).strip().replace("**", "").replace("`", "").strip()
+
+    server = clean(
+        re.search(r"Target\s+Server:\s*(.+)", full_text, re.IGNORECASE)
+    ) or clean(re.search(r"Server:\s*(.+)", full_text, re.IGNORECASE))
+
+    return {
+        "date": clean(re.search(r"Date:\s*(.+)", full_text, re.IGNORECASE)),
+        "time": clean(re.search(r"Time:\s*(.+)", full_text, re.IGNORECASE)),
+        "username": clean(re.search(r"Username:\s*(.+)", full_text, re.IGNORECASE)),
+        "server_name": server,
+        "user_id": clean(re.search(r"User ID:\s*(.+)", full_text, re.IGNORECASE)),
+    }
 
 
 class ScraperClient(discord.Client):
@@ -401,10 +238,7 @@ class ScraperClient(discord.Client):
             )
 
     async def on_message(self, message):
-        if message.author and self.user and message.author.id == self.user.id:
-            return
-
-        data = parse_join_log_message(message)
+        data = parse_join_log(collect_message_text(message))
         if data is None:
             return
 
