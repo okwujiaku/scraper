@@ -10,9 +10,11 @@ with CLIENT_INDEX).
 WARNING: Automating a user account (self-botting) violates Discord's ToS.
 """
 
+import asyncio
 import os
 import re
 import sys
+from datetime import datetime, timezone
 
 import discord
 from dotenv import load_dotenv
@@ -88,6 +90,18 @@ def _load_credentials(index: int) -> tuple[str, int, str]:
 
 CLIENT_INDEX = _client_index()
 TOKEN, CHAT_ID, CLIENT_NAME = _load_credentials(CLIENT_INDEX)
+
+POLL_SECONDS = int((os.getenv("POLL_SECONDS") or "45").strip() or 45)
+POLL_LIMIT = int((os.getenv("POLL_LIMIT") or "5").strip() or 5)
+MAX_LOG_CHANNELS = int((os.getenv("MAX_LOG_CHANNELS") or "120").strip() or 120)
+DEBUG_JOIN_LOGS = (os.getenv("DEBUG_JOIN_LOGS") or "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+LOG_CHANNEL_KEYWORDS = (
+    "welcome", "joins", "join", "gate", "logs", "log", "member", "members",
+    "audit", "arrival", "new", "notify", "bot", "general",
+)
 
 FIELD_STYLE = [
     ("Date", "date", "📅", C.CYAN),
@@ -300,7 +314,7 @@ def _parse_from_field_map(field_map: dict[str, str], full_text: str) -> dict | N
             r"Member\s*[:：]\s*(.+)",
         ):
             candidate = _clean_field(re.search(pattern, text, re.IGNORECASE))
-            if candidate and not _snowflake_from(candidate):
+            if candidate:
                 username = candidate
                 break
 
@@ -340,8 +354,45 @@ def _parse_from_field_map(field_map: dict[str, str], full_text: str) -> dict | N
     }
 
 
+def parse_join_log_strict(full_text: str) -> dict | None:
+    """Original Pikanto parser — tried first for backward compatibility."""
+    lowered = full_text.lower()
+    if not (
+        "username:" in lowered
+        and "user id:" in lowered
+        and ("new member joined" in lowered or "member joined!" in lowered)
+    ):
+        return None
+
+    def clean(match):
+        if not match:
+            return None
+        return match.group(1).strip().replace("**", "").replace("`", "").strip()
+
+    server = clean(
+        re.search(r"Target\s+Server:\s*(.+)", full_text, re.IGNORECASE)
+    ) or clean(re.search(r"Server:\s*(.+)", full_text, re.IGNORECASE))
+
+    username = clean(re.search(r"Username:\s*(.+)", full_text, re.IGNORECASE))
+    if not username:
+        return None
+
+    return {
+        "date": clean(re.search(r"Date:\s*(.+)", full_text, re.IGNORECASE)),
+        "time": clean(re.search(r"Time:\s*(.+)", full_text, re.IGNORECASE)),
+        "username": username,
+        "server_name": server or "Unknown",
+        "user_id": clean(re.search(r"User ID:\s*(.+)", full_text, re.IGNORECASE)) or "N/A",
+    }
+
+
 def parse_join_log_message(message: discord.Message) -> dict | None:
-    text = _normalize_field_lines(collect_message_text(message))
+    raw = collect_message_text(message)
+    strict = parse_join_log_strict(raw)
+    if strict:
+        return strict
+
+    text = _normalize_field_lines(raw)
     field_map = _embed_field_map(message)
 
     if message.embeds and field_map.get("username") and _has_join_phrase(text):
@@ -355,6 +406,9 @@ def parse_join_log_message(message: discord.Message) -> dict | None:
 
 
 def parse_join_log(full_text: str) -> dict | None:
+    strict = parse_join_log_strict(full_text)
+    if strict:
+        return strict
     text = _normalize_field_lines(full_text)
     if not is_join_log(text):
         return None
@@ -366,6 +420,140 @@ class ScraperClient(discord.Client):
         super().__init__(*args, **kwargs)
         self.target_chat_id = target_chat_id
         self._target_channel = None
+        self._log_channels: list[discord.TextChannel] = []
+        self._seen_message_ids: set[int] = set()
+        self._live_after: datetime | None = None
+        self._captures = 0
+        self._messages_seen = 0
+
+    def _channel_is_log(self, channel: discord.TextChannel) -> bool:
+        name = (channel.name or "").lower()
+        return any(k in name for k in LOG_CHANNEL_KEYWORDS)
+
+    def _discover_log_channels(self) -> list[discord.TextChannel]:
+        found: list[discord.TextChannel] = []
+        seen: set[int] = set()
+        for guild in self.guilds:
+            for channel in guild.text_channels:
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+                if channel.id in seen:
+                    continue
+                if self._channel_is_log(channel):
+                    found.append(channel)
+                    seen.add(channel.id)
+                if len(found) >= MAX_LOG_CHANNELS:
+                    return found
+        return found
+
+    async def _activate_log_channels(self) -> None:
+        self._log_channels = self._discover_log_channels()
+        warmed = 0
+        for channel in self._log_channels:
+            try:
+                async for _ in channel.history(limit=1):
+                    break
+                warmed += 1
+                await asyncio.sleep(0.15)
+            except Exception:
+                pass
+        print(
+            f"[{CLIENT_NAME}] Log channels: {len(self._log_channels)} matched, "
+            f"{warmed} opened for live events.",
+            flush=True,
+        )
+
+    async def _poll_log_channels(self) -> None:
+        if not self._log_channels:
+            self._log_channels = self._discover_log_channels()
+        for channel in self._log_channels:
+            try:
+                batch: list[discord.Message] = []
+                async for message in channel.history(limit=POLL_LIMIT):
+                    batch.append(message)
+                batch.sort(key=lambda m: m.created_at)
+                for message in batch:
+                    await self._handle_capture(message, source="poll")
+                await asyncio.sleep(0.12)
+            except Exception:
+                pass
+
+    async def _poll_loop(self) -> None:
+        await self.wait_until_ready()
+        await asyncio.sleep(8)
+        while not self.is_closed():
+            try:
+                await self._poll_log_channels()
+            except Exception as exc:
+                print(f"[{CLIENT_NAME}] Poll loop error: {exc}", flush=True)
+            await asyncio.sleep(POLL_SECONDS)
+
+    async def _heartbeat_loop(self) -> None:
+        await self.wait_until_ready()
+        while not self.is_closed():
+            await asyncio.sleep(180)
+            print(
+                f"[{CLIENT_NAME}] Heartbeat: {self._messages_seen} msgs seen, "
+                f"{self._captures} captures, {len(self._log_channels)} log channels.",
+                flush=True,
+            )
+
+    async def _handle_capture(self, message: discord.Message, source: str = "live") -> None:
+        if self._live_after and message.created_at:
+            created = message.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created < self._live_after:
+                return
+
+        if message.author and self.user and message.author.id == self.user.id:
+            return
+
+        if message.id in self._seen_message_ids:
+            return
+        self._seen_message_ids.add(message.id)
+        if len(self._seen_message_ids) > 10000:
+            self._seen_message_ids = set(list(self._seen_message_ids)[-6000:])
+
+        self._messages_seen += 1
+
+        data = parse_join_log_message(message)
+        if data is None:
+            if DEBUG_JOIN_LOGS:
+                text = collect_message_text(message)
+                low = text.lower()
+                if any(k in low for k in ("join", "username", "member", "welcome")):
+                    preview = (text[:160] + "...") if len(text) > 160 else text
+                    ch = getattr(message.channel, "name", message.channel)
+                    print(
+                        f"[{CLIENT_NAME}] [Debug] skipped ({source}) in #{ch}: {preview!r}",
+                        flush=True,
+                    )
+            return
+
+        self._captures += 1
+        process_extracted_data(data)
+
+        channel = self._target_channel
+        if channel is None:
+            if not self.target_chat_id:
+                return
+            try:
+                channel = await self.fetch_channel(self.target_chat_id)
+                self._target_channel = channel
+            except Exception as exc:
+                print(f"[{CLIENT_NAME}] Target chat unavailable: {exc}", flush=True)
+                return
+
+        try:
+            await channel.send(build_message(data))
+            print(
+                f"[{CLIENT_NAME}] Forwarded capture ({source}) for "
+                f"{data.get('username') or 'unknown'}.",
+                flush=True,
+            )
+        except Exception as exc:
+            print(f"[{CLIENT_NAME}] Send failed: {exc}", flush=True)
 
     async def on_ready(self):
         print(f"[{CLIENT_NAME}] Logged in as {self.user} (id: {self.user.id})", flush=True)
@@ -399,36 +587,15 @@ class ScraperClient(discord.Client):
                 f"[{CLIENT_NAME}] Could not open chat {self.target_chat_id}: {exc}",
                 flush=True,
             )
+            return
+
+        self._live_after = datetime.now(timezone.utc)
+        self.loop.create_task(self._activate_log_channels())
+        self.loop.create_task(self._poll_loop())
+        self.loop.create_task(self._heartbeat_loop())
 
     async def on_message(self, message):
-        if message.author and self.user and message.author.id == self.user.id:
-            return
-
-        data = parse_join_log_message(message)
-        if data is None:
-            return
-
-        process_extracted_data(data)
-
-        channel = self._target_channel
-        if channel is None:
-            if not self.target_chat_id:
-                return
-            try:
-                channel = await self.fetch_channel(self.target_chat_id)
-                self._target_channel = channel
-            except Exception as exc:
-                print(f"[{CLIENT_NAME}] Target chat unavailable: {exc}", flush=True)
-                return
-
-        try:
-            await channel.send(build_message(data))
-            print(
-                f"[{CLIENT_NAME}] Forwarded capture for {data.get('username') or 'unknown'}.",
-                flush=True,
-            )
-        except Exception as exc:
-            print(f"[{CLIENT_NAME}] Send failed: {exc}", flush=True)
+        await self._handle_capture(message, source="live")
 
 
 async def main():
